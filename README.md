@@ -1,3 +1,13 @@
+# Setup
+
+Get kernel [here](https://kernel.ubuntu.com/mainline/v5.17.7/)
+
+Run update script 
+```bash
+sudo ./setup/kernel_patch.sh
+```
+---
+
 This repo contains an implementation of the Homa transport protocol as a Linux kernel module.
 
 - For more information on Homa in general, see the [Homa
