@@ -12,6 +12,8 @@
 .tags*
 .deps
 *.pdf
+*.cmd
+*.d
 
 # Ignore IDE files
 /.idea/
