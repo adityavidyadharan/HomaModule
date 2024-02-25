@@ -1,5 +1,6 @@
 #!/bin/bash -i
 
+sudo apt-get update
 sudo apt-get install gcc-12 -y
 
 make
