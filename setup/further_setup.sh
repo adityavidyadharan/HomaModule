@@ -10,7 +10,7 @@ make
 cd ..
 sudo insmod homa.ko 
 
-sudo apt install python3-pip
+sudo apt install python3-pip -y
 python -m pip install matplotlib
 
 cd cloudlab
