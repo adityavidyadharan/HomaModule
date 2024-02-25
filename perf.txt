@@ -2,6 +2,56 @@ This file contains various notes and lessons learned concerning performance
 of the Homa Linux kernel module.  The notes are in reverse chronological
 order.
 
+49. (November 2023) Implemented "Gen3" load balancing scheme, renamed the
+    old scheme "Gen2". For details on load balancing, see balance.txt.
+    Gen3 seems to reduce significantly tail latency for cross-core handoffs;
+    here are a few samples(us):
+                     --Gen2 P50-   ---Gen2 P99---   --Gen3 P50-   --Gen3 P99-
+    GRO -> SoftIRQ   2.7 2.8 3.0   71.1 43.6 71.3   2.8 2.6 2.7   8.7 5.4 8.3
+    SoftIRQ -> App   0.3 0.3 0.3   20.5 21.7 19.9   0.3 0.3 0.3   7.2 6.8 9.0
+
+    However, this doesn't seem to translate into better overall performance:
+    standard slowdown graphs look about the same with Gen2 and Gen3 (Gen2 has
+    better P99 latency for W2 and W3; Gen3 is better for W5). This needs more
+    analysis.
+
+48. (August 2023) Unexpected packet loss on c6525-100g cluster (AMD processors,
+    100 Gbps links). Under some conditions (such as "cp_node client --one-way
+    --workload 1000000" with dynamic_windows=1 and unsched_bytes=50000)
+    messages suffer packet losses starting around offset 700000 and
+    continuing intermittently until the end of the message. I was unable
+    to identify a cause, but increasing the size of the Mellanox driver's
+    page cache (MLX5E_CACHE_SIZE, see item 46 below) seems to make the problem
+    go away. Slight configuration changes, such as unsched_bytes=200000 also
+    make the problem go away.
+
+47. (July 2023) Intel vs. AMD processors. 100B roundtrips under best-case
+    conditions are about 8.7 us slower on AMD processors than Intel:
+      xl170:        14.5 us
+      c6525-100g:   23.2 us
+    Places where c6525-100g is slower (each way):
+      Packet prep (Homa):     1.2 us
+      IP stack and driver :   0.9 us
+      Network (interrupts?):  1.7 us
+      Thread wakeup:          0.6 us
+    TCP is also slower on AMD:  38.7 us vs. 23.3 us
+    Note: results on AMD are particularly sensitive to core placement of
+    various components.
+
+46. (July 2023) MLX buffer issues on c6525-100g cluster. The Mellanox
+    driver is configured with 256 pages (1 MB) of receive buffer space
+    for each channel. With a 100 Gbps network, this is about 80 us of
+    time. However, a single thread can copy data from buffers to user space
+    at only about 40 Gbps, which means that with longer messages, the
+    copy gets behind and packet lifetimes increase: with 1 MB messages,
+    median lifetime is 77 us and P90 lifetime (i.e. the later packets in
+    messages) are 115 us. With multiple messages from one host to another,
+    the buffer cache is running dry. When this happens, the Mellanox driver
+    allocates (and eventually frees) additional buffers, which adds
+    significant overhead. Bottom line: it's essential to use multiple
+    channels to keep up with a 100 Gbps network (this provides a larger
+    total buffer pool, plus more threads to copy to user space).
+
 45. (January 2023) Up until now, output messages had to be completely copied
     into sk_buffs before transmission could begin. Modified Homa to pipeline
     the copy from user space with packet transmission. This makes a significant
@@ -85,7 +135,7 @@ order.
       messages at low load
 
 41. (December 2022) More analysis of SMI interrupts. Wrote smi.cc to gather
-    data on vents that cause all cores to stop simultaneously. Found 3 distinct
+    data on events that cause all cores to stop simultaneously. Found 3 distinct
     kinds of gaps on xl170 (Intel) CPUs:
     * 2.5 usec gaps every 4 ms
     * 17 usec gaps every 10 ms (however, these don't seem to be consistent:
@@ -95,7 +145,7 @@ order.
     gaps every 4 ms be scheduler wakeups?)
 
 40. (December 2022) NAPI can't process incoming jumbo frames at line rate
-    for 100 Gbps network (AMD CPUs): it takes at 850 ns to process each
+    for 100 Gbps network (AMD CPUs): it takes about 850 ns to process each
     packet (median), but packets are arriving every 700 ns.
     Most of the time is spent in __alloc_skb in two places:
     kmalloc_reserve for data:       370 ns
@@ -120,7 +170,7 @@ order.
 
 38. (December 2022) Restructured the receive buffer mechanism to mitigate
     the page_pool_alloc_pages_slow problem (see August 2022 below); packets
-    can now be copied to user space and their buffers release without waiting
+    can now be copied to user space and their buffers released without waiting
     for the entire message to be received. This has a significant impact on
     throughput. For "cp_node --one-way --client-max 4 --ports 1 --server-ports 1
     --port-threads 8" on the c6525-100g cluster:
@@ -307,8 +357,8 @@ TCP   P50    108.8 (3.5x)   192.7 (4.6x)  353.1 (7.5x)  385.7 (6.9x)
                      largest messages with modified W4 workload.
     gro_policy:      NORMAL always better; others 10-25% worse for short P99
     max_gro_skbs:    Larger is better; reducing to 5 hurts short P99 10-15%.
-                    However, anecdotal experience suggests that very large
-                    values can cause long delays for things like sending
+                     However, anecdotal experience suggests that very large
+                     values can cause long delays for things like sending
                      grants, so perhaps 10 is best?
     max_gso_size:    10K looks best; not much difference above that, 10-20%
                      degradation of short P99 at 5K
@@ -323,8 +373,10 @@ TCP   P50    108.8 (3.5x)   192.7 (4.6x)  353.1 (7.5x)  385.7 (6.9x)
                      lower short P99 for W2 and W3 than 4 receivers, but for
                      W5 3 receivers is 10% better than 2. Best choice: 3p2r?
     rtt_bytes:       60K is best, but not much sensitivity: 40K is < 10% worse
-    throttle_bytes:  Almost no noticeable difference from 100-2000; perhaps
-                     500 or 1000?
+    throttle_bytes:  Almost no noticeable difference from 100-2000; 100 is
+                     probably best because it includes more traffic in the
+                     computation of NIC queue length, reducing the probability
+                     of queue buildup
 
 29. (October 2020) Polling performance impact. In isolation, polling saves
     about 4 us RTT per RPC. In the workloads, it reduces short-message P50
@@ -460,7 +512,7 @@ Event                                                               Median
     so as not to interfere with user threads. This sometimes means it has to
     wait for a full time slice for other threads, which seems to be 5-7 ms.
     I tried disabling this feature of __do_softirq, so that all requests get
-    processed in the high-priority thread, and the P999 latency improved by
+    processed in the high-priority thread, and the P9999 latency improved by
     about 10x (< 1 ms worst case).
 
 18. (July 2020) Small-message latency. The best-case RTT for small messages

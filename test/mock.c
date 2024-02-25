@@ -66,15 +66,15 @@ struct task_struct mock_task;
  */
 int mock_xmit_log_verbose = 0;
 
+/* If a test sets this variable to nonzero, ip_queue_xmit will log
+ * the contents of the homa_info from packets.
+ */
+int mock_xmit_log_homa_info = 0;
+
 /* If a test sets this variable to nonzero, call_rcu_sched will log
  * whenever it is invoked.
  */
 int mock_log_rcu_sched = 0;
-
-/* The maximum number of grants that can be issued in one call to
- * homa_send_grants.
- */
-int mock_max_grants = 10;
 
 /* A zero value means that copy_to_user will actually copy bytes to
  * the destination address; if nonzero, then 0 bits determine which
@@ -578,6 +578,12 @@ int ip6_xmit(const struct sock *sk, struct sk_buff *skb, struct flowi6 *fl6,
 	else
 		homa_print_packet_short(skb, buffer, sizeof(buffer));
 	unit_log_printf("; ", "xmit %s", buffer);
+	if (mock_xmit_log_homa_info) {
+		struct homa_skb_info *homa_info;
+		homa_info = homa_get_skb_info(skb);
+		unit_log_printf("; ", "homa_info: wire_bytes %d, data_bytes %d",
+				homa_info->wire_bytes, homa_info->data_bytes);
+	}
 	kfree_skb(skb);
 	return 0;
 }
@@ -604,6 +610,12 @@ int ip_queue_xmit(struct sock *sk, struct sk_buff *skb, struct flowi *fl)
 	else
 		homa_print_packet_short(skb, buffer, sizeof(buffer));
 	unit_log_printf("; ", "xmit %s", buffer);
+	if (mock_xmit_log_homa_info) {
+		struct homa_skb_info *homa_info;
+		homa_info = homa_get_skb_info(skb);
+		unit_log_printf("; ", "homa_info: wire_bytes %d, data_bytes %d",
+				homa_info->wire_bytes, homa_info->data_bytes);
+	}
 	kfree_skb(skb);
 	return 0;
 }
@@ -743,6 +755,7 @@ void mutex_lock(struct mutex *lock)
 
 void mutex_unlock(struct mutex *lock)
 {
+	UNIT_HOOK("unlock");
 	mock_active_locks--;
 }
 
@@ -833,6 +846,7 @@ int __lockfunc _raw_spin_trylock_bh(raw_spinlock_t *lock)
 
 void __lockfunc _raw_spin_unlock_bh(raw_spinlock_t *lock)
 {
+	UNIT_HOOK("unlock");
 	mock_active_locks--;
 }
 
@@ -867,6 +881,9 @@ void schedule(void)
 }
 
 void security_sk_classify_flow(struct sock *sk, struct flowi_common *flic) {}
+
+void __show_free_areas(unsigned int filter, nodemask_t *nodemask,
+		int max_zone_idx) {}
 
 void sk_common_release(struct sock *sk) {}
 
@@ -1042,8 +1059,11 @@ long wait_woken(struct wait_queue_entry *wq_entry, unsigned mode,
 	return 0;
 }
 
-void __wake_up(struct wait_queue_head *wq_head, unsigned int mode,
-		int nr_exclusive, void *key) {}
+int __wake_up(struct wait_queue_head *wq_head, unsigned int mode,
+		int nr_exclusive, void *key)
+{
+	return 0;
+}
 
 int wake_up_process(struct task_struct *tsk)
 {
@@ -1262,6 +1282,7 @@ void mock_sock_init(struct homa_sock *hsk, struct homa *homa, int port)
 	mock_mtu = UNIT_TEST_DATA_PER_PACKET + hsk->ip_header_length
 		+ sizeof(struct data_header);
 	mock_net_device.gso_max_size = mock_mtu;
+	homa_pool_init(hsk, (void *) 0x1000000, 100*HOMA_BPAGE_SIZE);
 }
 
 /**
@@ -1271,6 +1292,7 @@ void mock_sock_init(struct homa_sock *hsk, struct homa *homa, int port)
  */
 void mock_spin_unlock(spinlock_t *lock)
 {
+	UNIT_HOOK("unlock");
 	mock_active_locks--;
 }
 
@@ -1296,7 +1318,6 @@ void mock_teardown(void)
 	mock_ip6_xmit_errors = 0;
 	mock_ip_queue_xmit_errors = 0;
 	mock_kmalloc_errors = 0;
-	mock_max_grants = 10;
 	mock_copy_to_user_dont_copy = 0;
 	mock_bpage_size = 0x10000;
 	mock_bpage_shift = 16;
@@ -1309,6 +1330,7 @@ void mock_teardown(void)
 	memset(&mock_task, 0, sizeof(mock_task));
 	mock_signal_pending = 0;
 	mock_xmit_log_verbose = 0;
+	mock_xmit_log_homa_info = 0;
 	mock_mtu = 0;
 	mock_net_device.gso_max_size = 0;
 

@@ -31,7 +31,6 @@ MODULE_VERSION("0.01");
 long sysctl_homa_mem[3] __read_mostly;
 int sysctl_homa_rmem_min __read_mostly;
 int sysctl_homa_wmem_min __read_mostly;
-atomic_long_t homa_memory_allocated;
 
 /* Global data for Homa. Never reference homa_data directory. Always use
  * the homa variable instead; this allows overriding during unit tests.
@@ -47,11 +46,10 @@ static bool exiting = false;
 /* Thread that runs timer code to detect lost packets and crashed peers. */
 static struct task_struct *timer_kthread;
 
-/* Set via sysctl to request that information on a particular topic
- * be printed to the system log. The value written determines the
- * topic.
+/* Set via sysctl to request that a particular action be taken. The value
+ * written determines the action.
  */
-static int log_topic;
+static int action;
 
 /* This structure defines functions that handle various operations on
  * Homa sockets. These functions are relatively generic: they are called
@@ -129,7 +127,6 @@ struct proto homa_prot = {
 	.unhash		   = homa_unhash,
 	.rehash		   = homa_rehash,
 	.get_port	   = homa_get_port,
-	.memory_allocated  = &homa_memory_allocated,
 	.sysctl_mem	   = sysctl_homa_mem,
 	.sysctl_wmem	   = &sysctl_homa_wmem_min,
 	.sysctl_rmem	   = &sysctl_homa_rmem_min,
@@ -158,7 +155,6 @@ struct proto homav6_prot = {
 	.unhash		   = homa_unhash,
 	.rehash		   = homa_rehash,
 	.get_port	   = homa_get_port,
-	.memory_allocated  = &homa_memory_allocated,
 	.sysctl_mem	   = sysctl_homa_mem,
 	.sysctl_wmem	   = &sysctl_homa_wmem_min,
 	.sysctl_rmem	   = &sysctl_homa_rmem_min,
@@ -215,8 +211,22 @@ static struct proc_dir_entry *metrics_dir_entry = NULL;
 /* Used to configure sysctl access to Homa configuration parameters.*/
 static struct ctl_table homa_ctl_table[] = {
 	{
+		.procname	= "action",
+		.data		= &action,
+		.maxlen		= sizeof(int),
+		.mode		= 0644,
+		.proc_handler	= homa_dointvec
+	},
+	{
 		.procname	= "bpage_lease_usecs",
 		.data		= &homa_data.bpage_lease_usecs,
+		.maxlen		= sizeof(int),
+		.mode		= 0644,
+		.proc_handler	= homa_dointvec
+	},
+	{
+		.procname	= "busy_usecs",
+		.data		= &homa_data.busy_usecs,
 		.maxlen		= sizeof(int),
 		.mode		= 0644,
 		.proc_handler	= homa_dointvec
@@ -236,8 +246,8 @@ static struct ctl_table homa_ctl_table[] = {
 		.proc_handler	= proc_dointvec
 	},
 	{
-		.procname	= "duty_cycle",
-		.data		= &homa_data.duty_cycle,
+		.procname	= "fifo_grant_increment",
+		.data		= &homa_data.fifo_grant_increment,
 		.maxlen		= sizeof(int),
 		.mode		= 0644,
 		.proc_handler	= homa_dointvec
@@ -257,6 +267,13 @@ static struct ctl_table homa_ctl_table[] = {
 		.proc_handler	= proc_dointvec
 	},
 	{
+		.procname	= "gen3_softirq_cores",
+		.data		= NULL,
+		.maxlen		= 0,
+		.mode		= 0644,
+		.proc_handler	= homa_sysctl_softirq_cores
+	},
+	{
 		.procname	= "grant_fifo_fraction",
 		.data		= &homa_data.grant_fifo_fraction,
 		.maxlen		= sizeof(int),
@@ -264,14 +281,7 @@ static struct ctl_table homa_ctl_table[] = {
 		.proc_handler	= homa_dointvec
 	},
 	{
-		.procname	= "fifo_grant_increment",
-		.data		= &homa_data.fifo_grant_increment,
-		.maxlen		= sizeof(int),
-		.mode		= 0644,
-		.proc_handler	= homa_dointvec
-	},
-	{
-		.procname	= "gro_busy_us",
+		.procname	= "gro_busy_usecs",
 		.data		= &homa_data.gro_busy_usecs,
 		.maxlen		= sizeof(int),
 		.mode		= 0644,
@@ -299,20 +309,6 @@ static struct ctl_table homa_ctl_table[] = {
 		.proc_handler	= homa_dointvec
 	},
 	{
-		.procname	= "log_topic",
-		.data		= &log_topic,
-		.maxlen		= sizeof(int),
-		.mode		= 0644,
-		.proc_handler	= homa_dointvec
-	},
-	{
-		.procname	= "pacer_fifo_fraction",
-		.data		= &homa_data.pacer_fifo_fraction,
-		.maxlen		= sizeof(int),
-		.mode		= 0644,
-		.proc_handler	= homa_dointvec
-	},
-	{
 		.procname	= "max_dead_buffs",
 		.data		= &homa_data.max_dead_buffs,
 		.maxlen		= sizeof(int),
@@ -320,8 +316,8 @@ static struct ctl_table homa_ctl_table[] = {
 		.proc_handler	= proc_dointvec
 	},
 	{
-		.procname	= "max_grant_window",
-		.data		= &homa_data.max_grant_window,
+		.procname	= "max_grantable_rpcs",
+		.data		= &homa_data.max_grantable_rpcs,
 		.maxlen		= sizeof(int),
 		.mode		= 0644,
 		.proc_handler	= homa_dointvec
@@ -348,11 +344,25 @@ static struct ctl_table homa_ctl_table[] = {
 		.proc_handler	= homa_dointvec
 	},
 	{
+		.procname	= "max_incoming",
+		.data		= &homa_data.max_incoming,
+		.maxlen		= sizeof(int),
+		.mode		= 0644,
+		.proc_handler	= homa_dointvec
+	},
+	{
 		.procname	= "max_overcommit",
 		.data		= &homa_data.max_overcommit,
 		.maxlen		= sizeof(int),
 		.mode		= 0644,
 		.proc_handler	= homa_dointvec
+	},
+	{
+		.procname	= "max_rpcs_per_peer",
+		.data		= &homa_data.max_rpcs_per_peer,
+		.maxlen		= sizeof(int),
+		.mode		= 0444,
+		.proc_handler	= proc_dointvec
 	},
 	{
 		.procname	= "max_sched_prio",
@@ -362,8 +372,22 @@ static struct ctl_table homa_ctl_table[] = {
 		.proc_handler	= proc_dointvec
 	},
 	{
+		.procname	= "next_id",
+		.data		= &homa_data.next_id,
+		.maxlen		= sizeof(int),
+		.mode		= 0644,
+		.proc_handler	= homa_dointvec
+	},
+	{
 		.procname	= "num_priorities",
 		.data		= &homa_data.num_priorities,
+		.maxlen		= sizeof(int),
+		.mode		= 0644,
+		.proc_handler	= homa_dointvec
+	},
+	{
+		.procname	= "pacer_fifo_fraction",
+		.data		= &homa_data.pacer_fifo_fraction,
 		.maxlen		= sizeof(int),
 		.mode		= 0644,
 		.proc_handler	= homa_dointvec
@@ -411,13 +435,6 @@ static struct ctl_table homa_ctl_table[] = {
 		.proc_handler	= proc_dointvec
 	},
 	{
-		.procname	= "rtt_bytes",
-		.data		= &homa_data.rtt_bytes,
-		.maxlen		= sizeof(int),
-		.mode		= 0644,
-		.proc_handler	= homa_dointvec
-	},
-	{
 		.procname	= "sync_freeze",
 		.data		= &homa_data.sync_freeze,
 		.maxlen		= sizeof(int),
@@ -446,6 +463,13 @@ static struct ctl_table homa_ctl_table[] = {
 		.proc_handler	= proc_dointvec
 	},
 	{
+		.procname	= "unsched_bytes",
+		.data		= &homa_data.unsched_bytes,
+		.maxlen		= sizeof(int),
+		.mode		= 0644,
+		.proc_handler	= homa_dointvec
+	},
+	{
 		.procname	= "unsched_cutoffs",
 		.data		= &homa_data.unsched_cutoffs,
 		.maxlen		= HOMA_MAX_PRIORITIES*sizeof(int),
@@ -455,6 +479,13 @@ static struct ctl_table homa_ctl_table[] = {
 	{
 		.procname	= "verbose",
 		.data		= &homa_data.verbose,
+		.maxlen		= sizeof(int),
+		.mode		= 0644,
+		.proc_handler	= homa_dointvec
+	},
+	{
+		.procname	= "window",
+		.data		= &homa_data.window,
 		.maxlen		= sizeof(int),
 		.mode		= 0644,
 		.proc_handler	= homa_dointvec
@@ -812,8 +843,7 @@ int homa_setsockopt(struct sock *sk, int level, int optname, sockptr_t optval,
 		return -EFAULT;
 
 	homa_sock_lock(hsk, "homa_setsockopt SO_HOMA_SET_BUF");
-	ret = homa_pool_init(&hsk->buffer_pool, hsk->homa, args.start,
-			args.length);
+	ret = homa_pool_init(hsk, args.start, args.length);
 	homa_sock_unlock(hsk);
 	INC_METRIC(so_set_buf_calls, 1);
 	INC_METRIC(so_set_buf_cycles, get_cycles() - start);
@@ -855,6 +885,7 @@ int homa_sendmsg(struct sock *sk, struct msghdr *msg, size_t length) {
 	struct homa_rpc *rpc = NULL;
 	sockaddr_in_union *addr = (sockaddr_in_union *) msg->msg_name;
 
+	homa_cores[raw_smp_processor_id()]->last_app_active = start;
 	if (unlikely(!msg->msg_control_is_user)) {
 		result = -EINVAL;
 		goto error;
@@ -965,14 +996,13 @@ error:
  * @sk:          Socket on which the system call was invoked.
  * @msg:         Controlling information for the receive.
  * @len:         Total bytes of space available in msg->msg_iov; not used.
- * @nonblocking: Non-zero means MSG_DONTWAIT was specified.
  * @flags:       Flags from system call, not including MSG_DONTWAIT; ignored.
  * @addr_len:    Store the length of the sender address here
  * Return:       The length of the message on success, otherwise a negative
  *               errno.
  */
-int homa_recvmsg(struct sock *sk, struct msghdr *msg, size_t len,
-		 int nonblocking, int flags, int *addr_len)
+int homa_recvmsg(struct sock *sk, struct msghdr *msg, size_t len, int flags,
+		 int *addr_len)
 {
 	struct homa_sock *hsk = homa_sk(sk);
 	struct homa_recvmsg_args control;
@@ -982,6 +1012,7 @@ int homa_recvmsg(struct sock *sk, struct msghdr *msg, size_t len,
 	int result;
 
 	INC_METRIC(recv_calls, 1);
+	homa_cores[raw_smp_processor_id()]->last_app_active = start;
 	if (unlikely(!msg->msg_control)) {
 		/* This test isn't strictly necessary, but it provides a
 		 * hook for testing kernel call times.
@@ -998,7 +1029,7 @@ int homa_recvmsg(struct sock *sk, struct msghdr *msg, size_t len,
 		goto done;
 	}
 	control.completion_cookie = 0;
-	if (control._pad[0] || control._pad[1]) {
+	if (control._pad[0]) {
 		result = -EINVAL;
 		goto done;
 	}
@@ -1014,9 +1045,7 @@ int homa_recvmsg(struct sock *sk, struct msghdr *msg, size_t len,
 			control.bpage_offsets);
 	control.num_bpages = 0;
 
-	rpc = homa_wait_for_message(hsk, nonblocking
-			? (control.flags | HOMA_RECVMSG_NONBLOCKING)
-			: control.flags, control.id);
+	rpc = homa_wait_for_message(hsk, control.flags, control.id);
 	if (IS_ERR(rpc)) {
 		/* If we get here, it means there was an error that prevented
 		 * us from finding an RPC to return. If there's an error in
@@ -1025,7 +1054,7 @@ int homa_recvmsg(struct sock *sk, struct msghdr *msg, size_t len,
 		result = PTR_ERR(rpc);
 		goto done;
 	}
-	result = rpc->error ? rpc->error : rpc->msgin.total_length;
+	result = rpc->error ? rpc->error : rpc->msgin.length;
 
 	/* Generate time traces on both ends for long elapsed times (used
 	 * for performance debugging).
@@ -1035,12 +1064,13 @@ int homa_recvmsg(struct sock *sk, struct msghdr *msg, size_t len,
 		if ((elapsed <= hsk->homa->temp[1])
 				&& (elapsed >= hsk->homa->temp[0])
 				&& homa_is_client(rpc->id)
-				&& (rpc->msgin.total_length < 500)) {
+				&& (rpc->msgin.length >= hsk->homa->temp[2])
+				&& (rpc->msgin.length < hsk->homa->temp[3])) {
 			tt_record4("Long RTT: kcycles %d, id %d, peer 0x%x, "
 					"length %d",
 					elapsed, rpc->id,
 					tt_addr(rpc->peer->addr),
-					rpc->msgin.total_length);
+					rpc->msgin.length);
 			homa_freeze(rpc, SLOW_RPC, "Freezing because of long "
 					"elapsed time for RPC id %d, peer 0x%x");
 		}
@@ -1049,7 +1079,7 @@ int homa_recvmsg(struct sock *sk, struct msghdr *msg, size_t len,
 	/* Collect result information. */
 	control.id = rpc->id;
 	control.completion_cookie = rpc->completion_cookie;
-	if (likely(rpc->msgin.total_length >= 0)) {
+	if (likely(rpc->msgin.length >= 0)) {
 		control.num_bpages = rpc->msgin.num_bpages;
 		memcpy(control.bpage_offsets, rpc->msgin.bpage_offsets,
 				sizeof(control.bpage_offsets));
@@ -1068,6 +1098,7 @@ int homa_recvmsg(struct sock *sk, struct msghdr *msg, size_t len,
 				rpc->peer->addr);
 		*addr_len = sizeof(*in4);
 	}
+	memcpy(&control.peer_addr, msg->msg_name, *addr_len);
 	/* This indicates that the application now owns the buffers, so
 	 * we won't free them in homa_rpc_free.
 	 */
@@ -1218,7 +1249,7 @@ int homa_softirq(struct sk_buff *skb) {
 	int pull_length;
 	struct homa_lcache lcache;
 
-	/* Accumulates changes to homa->incoming, to avoid repeated
+	/* Accumulates changes to homa->total_incoming, to avoid repeated
 	 * updates to this shared variable.
 	 */
 	int incoming_delta = 0;
@@ -1320,15 +1351,13 @@ int homa_softirq(struct sk_buff *skb) {
 			 * unknown.
 			 */
 			if (!tt_frozen) {
+				homa_rpc_log_active_tt(homa, 0);
 				tt_record4("Freezing because of request on "
 						"port %d from 0x%x:%d, id %d",
 						ntohs(h->dport), tt_addr(saddr),
 						ntohs(h->sport),
 						homa_local_id(h->sender_id));
 				tt_freeze();
-//				homa_rpc_log_active(homa, h->id);
-//				homa_log_grantable_list(homa);
-//				homa_log_throttled(homa);
 			}
 			goto discard;
 		}
@@ -1604,26 +1633,115 @@ int homa_dointvec(struct ctl_table *table, int write,
 			homa_prios_changed(homa);
 		}
 
+		if (homa->next_id != 0) {
+			atomic64_set(&homa->next_outgoing_id, homa->next_id);
+			homa->next_id = 0;
+		}
+
 		/* Handle the special value log_topic by invoking a function
 		 * to print information to the log.
 		 */
-		if (table->data == &log_topic) {
-			if (log_topic == 1)
+		if (table->data == &action) {
+			if (action == 1)
 				homa_log_grantable_list(homa);
-			else if (log_topic == 2)
+			else if (action == 2)
 				homa_rpc_log_active(homa, 0);
-			else if (log_topic == 3) {
+			else if (action == 3) {
 				tt_record("Freezing because of sysctl");
 				tt_freeze();
-			} else if (log_topic == 4)
+			} else if (action == 4)
 				homa_log_throttled(homa);
-			else if (log_topic == 5)
+			else if (action == 5)
 				tt_printk();
-			else
-				homa_rpc_log_active(homa, log_topic);
-			log_topic = 0;
+			else if (action == 6) {
+				tt_record("Calling homa_rpc_log_active because "
+						"of action 6");
+				homa_rpc_log_active_tt(homa, 0);
+				tt_record("Freezing because of action 6");
+				tt_freeze();
+			} else if (action == 7) {
+				homa_rpc_log_active_tt(homa, 0);
+				tt_record("Freezing cluster because of action 7");
+				homa_freeze_peers(homa);
+				tt_record("Finished freezing cluster");
+				tt_freeze();
+			} else
+				homa_rpc_log_active(homa, action);
+			action = 0;
 		}
 	}
+	return result;
+}
+
+/**
+ * homa_sysctl_softirq_cores() - This function is invoked to handle sysctl
+ * requests for the "gen3_softirq_cores" target, which requires special
+ * processing.
+ * @table:    sysctl table describing value to be read or written.
+ * @write:    Nonzero means value is being written, 0 means read.
+ * @buffer:   Address in user space of the input/output data.
+ * @lenp:     Not exactly sure.
+ * @ppos:     Not exactly sure.
+ *
+ * Return: 0 for success, nonzero for error.
+ */
+int homa_sysctl_softirq_cores(struct ctl_table *table, int write,
+		void __user *buffer, size_t *lenp, loff_t *ppos)
+{
+	int result, i;
+	struct ctl_table table_copy;
+	struct homa_core *core;
+	int max_values, *values;
+
+	max_values = (NUM_GEN3_SOFTIRQ_CORES + 1) * nr_cpu_ids;
+	values = (int *) kmalloc(max_values * sizeof(int), GFP_KERNEL);
+	if (values == NULL)
+		return -ENOMEM;
+
+	table_copy = *table;
+	table_copy.data = values;
+	if (write) {
+		/* First value is core id, others are contents of its
+		 * gen3_softirq_cores.
+		 */
+		for (i = 0; i < max_values ; i++)
+			values[i] = -1;
+		table_copy.maxlen = max_values;
+		result = proc_dointvec(&table_copy, write, buffer, lenp, ppos);
+		if (result != 0)
+			goto done;
+		for (i = 0; i < max_values;
+				i += NUM_GEN3_SOFTIRQ_CORES + 1) {
+			int j;
+			if (values[i] < 0)
+				break;
+			core = homa_cores[values[i]];
+			for (j = 0; j < NUM_GEN3_SOFTIRQ_CORES; j++)
+				core->gen3_softirq_cores[j] = values[i+j+1];
+		}
+	} else {
+		/* Read: return values from all of the cores. */
+		int *dst;
+
+		table_copy.maxlen = 0;
+		dst = values;
+		for (i = 0; i < nr_cpu_ids; i++) {
+			int j;
+
+			*dst = i;
+			dst++;
+			table_copy.maxlen += sizeof(int);
+			core = homa_cores[i];
+			for (j = 0; j < NUM_GEN3_SOFTIRQ_CORES; j++) {
+				*dst = core->gen3_softirq_cores[j];
+				dst++;
+				table_copy.maxlen += sizeof(int);
+			}
+		}
+		result = proc_dointvec(&table_copy, write, buffer, lenp, ppos);
+	}
+done:
+	kfree(values);
 	return result;
 }
 

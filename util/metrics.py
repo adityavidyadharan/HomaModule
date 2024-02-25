@@ -1,6 +1,6 @@
 #!/usr/bin/python3
 
-# Copyright (c) 2019-2022 Stanford University
+# Copyright (c) 2019-2023 Stanford University
 #
 # Permission to use, copy, modify, and distribute this software for any
 # purpose with or without fee is hereby granted, provided that the above
@@ -97,7 +97,9 @@ def scale_number(number):
     suffix to keep the number small and readable
     """
 
-    if number > 1000000:
+    if number > 1e9:
+        return "%5.1f G" % (number/1e9)
+    elif number > 1000000:
         return "%5.1f M" % (number/1000000.0)
     elif (number > 1000):
         return "%5.1f K" % (number/1000.0)
@@ -196,7 +198,7 @@ for symbol in symbols:
                   "avg_dead_skbs", delta/deltas["reaper_calls"], pad))
         if symbol.endswith("_miss_cycles") and (time_delta != 0):
             prefix = symbol[:-12]
-            if (prefix + "_misses") in deltas:
+            if ((prefix + "_misses") in deltas) and (deltas[prefix + "_misses"] != 0):
                 ns = (delta/deltas[prefix + "_misses"])/(cpu_khz * 1e-06)
                 print("%-28s          %6.1f %sAvg. wait time per %s miss (ns)" % (
                     prefix + "_miss_delay", ns, pad, prefix))
@@ -209,6 +211,11 @@ for symbol in symbols:
 if gro_packets != 0:
     print("%-28s          %6.2f %sHoma packets per homa_softirq call" % (
           "gro_benefit", float(total_packets)/float(gro_packets), pad))
+avg_grantable_rpcs = 0.0
+if ("grantable_rpcs_integral" in deltas) and (time_delta != 0):
+    avg_grantable_rpcs = float(deltas["grantable_rpcs_integral"])/time_delta
+    print("%-28s          %6.2f %sAverage number of grantable incoming RPCs" % (
+          "avg_grantable_rpcs", avg_grantable_rpcs, pad))
 
 if elapsed_secs != 0:
     print("\nPer-Core CPU Usage:")
@@ -248,6 +255,14 @@ if elapsed_secs != 0:
                 busiest_core = core
         print(line)
     print("\nBusiest core: %d (%.2f)" % (busiest_core, totals[busiest_core]))
+    other_busy = ""
+    for core in range(0, num_cores):
+        if (totals[core] >= 0.8) and (core != busiest_core):
+            if other_busy:
+                other_busy += ", "
+            other_busy += " %d (%.2f)" % (core, totals[core]);
+    if other_busy:
+        print("Other busy cores: %s" % (other_busy))
 
     packets_received = 0.0
     packets_sent = 0.0
@@ -347,7 +362,7 @@ if elapsed_secs != 0:
     print("\nLock Misses:")
     print("------------")
     print("            Misses/sec.  ns/Miss   %CPU")
-    for lock in ["client", "socket", "grantable", "throttle", "peer_ack"]:
+    for lock in ["client", "server", "socket", "grantable", "throttle", "peer_ack"]:
         misses = float(deltas[lock + "_lock_misses"])
         cycles = float(deltas[lock + "_lock_miss_cycles"])
         if misses == 0:
@@ -365,30 +380,58 @@ if elapsed_secs != 0:
         print("-------------------")
         poll_percent = 100.0*float(deltas["fast_wakeups"])/total_messages
         sleep_percent = 100.0*float(deltas["slow_wakeups"])/total_messages
-        print("Available immediately:   %4.1f%%" % (100.0 - poll_percent
+        if deltas["gen3_alt_handoffs"]:
+            gen3_alt_percent = (100.0*deltas["gen3_alt_handoffs"]
+                    /deltas["gen3_handoffs"])
+        else:
+            gen3_alt_percent = 0.0
+        if deltas["handoffs_alt_thread"]:
+            alt_thread_percent = (100.0*deltas["handoffs_alt_thread"]
+                    /deltas["handoffs_thread_waiting"])
+        else:
+            alt_thread_percent = 0.0
+        if deltas["packets_rcvd_DATA"]:
+            data_bypass_percent = (100.0*deltas["gro_data_bypasses"]
+                        /deltas["packets_rcvd_DATA"])
+        else:
+            data_bypass_percent = 0.0
+        if deltas["packets_rcvd_GRANT"]:
+            grant_bypass_percent = (100.0*deltas["gro_grant_bypasses"]
+                        /deltas["packets_rcvd_GRANT"])
+        else:
+            grant_bypass_percent = 0.0
+        print("Available immediately:        %5.1f%%" % (100.0 - poll_percent
                 - sleep_percent))
-        print("Arrived while polling:   %4.1f%%" % (poll_percent))
-        print("Blocked at least once:   %4.1f%%" % (sleep_percent))
+        print("Arrived while polling:        %5.1f%%" % (poll_percent))
+        print("Blocked at least once:        %5.1f%%" % (sleep_percent))
+        print("Alternate GRO handoffs:       %5.1f%%" % (gen3_alt_percent))
+        print("Alternate thread handoffs:    %5.1f%%" % (alt_thread_percent))
+        print("GRO bypass for data packets:  %5.1f%%" % (data_bypass_percent))
+        print("GRO bypass for grant packets: %5.1f%%" % (grant_bypass_percent))
 
     print("\nMiscellaneous:")
     print("--------------")
     if packets_received > 0:
-        print("Bytes/packet rcvd: %6.0f" % (
+        print("Bytes/packet rcvd:    %6.0f" % (
                 total_received_bytes/packets_received))
-        print("Packets received:   %5.3f M/sec" % (
+        print("Packets received:      %5.3f M/sec" % (
                 1e-6*packets_received/elapsed_secs))
-        print("Packets sent:       %5.3f M/sec" % (
+        print("Packets sent:          %5.3f M/sec" % (
                 1e-6*packets_sent/elapsed_secs))
-        print("Core efficiency:    %5.3f M packets/sec/core "
+        print("Core efficiency:       %5.3f M packets/sec/core "
                 "(sent & received combined)" % (
                 1e-6*(packets_sent + packets_received)/elapsed_secs
                 /total_cores_used))
-        print("                   %5.2f  Gbps/core (goodput)" % (
+        print("                      %5.2f  Gbps/core (goodput)" % (
                 8e-9*(total_received_bytes + float(deltas["sent_msg_bytes"]))
                 /(total_cores_used * elapsed_secs)))
+    if deltas["pacer_cycles"] != 0:
+        pacer_secs = float(deltas["pacer_cycles"])/(cpu_khz * 1000.0)
+        print("Pacer throughput:     %5.2f  Gbps (pacer output when pacer running)" % (
+                deltas["pacer_bytes"]*8e-09/pacer_secs))
     if deltas["throttled_cycles"] != 0:
         throttled_secs = float(deltas["throttled_cycles"])/(cpu_khz * 1000.0)
-        print("Pacer throughput:  %5.2f  Gbps" % (
+        print("Throttled throughput:  %5.2f  Gbps (pacer output when throttled)" % (
                 deltas["pacer_bytes"]*8e-09/throttled_secs))
 
     print("\nCanaries (possible problem indicators):")
@@ -401,13 +444,14 @@ if elapsed_secs != 0:
                 percent = "(%.1f%%)" % (100.0*float(delta)/float(received))
                 percent = percent.ljust(12)
                 print("%-28s %15d %s %s" % (symbol, delta, percent, docs[symbol]))
-    for symbol in ["resent_packets", "resent_packets_used", "unknown_rpcs",
+    for symbol in ["resent_packets", "resent_packets_used",
+            "packet_discards", "resent_discards", "unknown_rpcs",
             "peer_kmalloc_errors", "peer_route_errors", "control_xmit_errors",
             "data_xmit_errors",
             "server_cant_create_rpcs", "server_cant_create_rpcs",
-            "short_packets", "redundant_packets",
-            "peer_timeouts", "server_rpc_discards",
-            "server_rpcs_unknown", "forced_reaps"]:
+            "short_packets", "peer_timeouts", "server_rpc_discards",
+            "server_rpcs_unknown", "forced_reaps", "buffer_alloc_failures",
+            "dropped_data_no_bufs", "linux_pkt_alloc_bytes"]:
         if deltas[symbol] == 0:
             continue
         rate = float(deltas[symbol])/elapsed_secs
@@ -433,3 +477,6 @@ if elapsed_secs != 0:
                 % ("acks_per_rpc", 1000.0 * deltas["packets_sent_ACK"]
                 / deltas["responses_received"]))
 
+    if avg_grantable_rpcs > 1.0:
+        print("%-28s          %6.2f %sAverage number of grantable incoming RPCs" % (
+              "avg_grantable_rpcs", avg_grantable_rpcs, pad))

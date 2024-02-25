@@ -1,4 +1,4 @@
-/* Copyright (c) 2019-2022 Stanford University
+/* Copyright (c) 2019-2023 Stanford University
  *
  * Permission to use, copy, modify, and/or distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -37,7 +37,6 @@ FIXTURE_SETUP(homa_offload)
 	int i;
 	homa_init(&self->homa);
 	self->homa.flags |= HOMA_FLAG_DONT_THROTTLE;
-	self->homa.grant_threshold = self->homa.rtt_bytes;
 	homa = &self->homa;
 	mock_sock_init(&self->hsk, &self->homa, 99);
 	self->ip = unit_get_in_addr("196.168.0.1");
@@ -74,6 +73,11 @@ FIXTURE_SETUP(homa_offload)
 	list_add_tail(&self->skb2->list, &self->napi.gro_hash[2].list);
 	INIT_LIST_HEAD(&self->empty_list);
 	unit_log_clear();
+
+	/* Configure so core isn't considered too busy for bypasses. */
+	mock_cycles = 1000;
+	self->homa.gro_busy_cycles = 500;
+	homa_cores[cpu_number]->last_gro = 400;
 }
 FIXTURE_TEARDOWN(homa_offload)
 {
@@ -104,43 +108,6 @@ TEST_F(homa_offload, homa_gso_segment_set_ip_ids)
 	kfree_skb(segs);
 }
 
-TEST_F(homa_offload, homa_gro_receive__fast_grant_optimization)
-{
-	struct in6_addr client_ip = unit_get_in_addr("196.168.0.1");
-	struct in6_addr server_ip = unit_get_in_addr("1.2.3.4");
-	int client_port = 40000;
-	__u64 client_id = 1234;
-	__u64 server_id = 1235;
-	struct homa_rpc *srpc = unit_server_rpc(&self->hsk, UNIT_OUTGOING,
-			&client_ip, &server_ip, client_port, server_id, 100,
-			20000);
-	ASSERT_NE(NULL, srpc);
-	homa_xmit_data(srpc, false);
-	unit_log_clear();
-
-	struct grant_header h = {{.sport = htons(srpc->dport),
-	                .dport = htons(self->hsk.port),
-			.sender_id = cpu_to_be64(client_id),
-			.type = GRANT},
-		        .offset = htonl(12600),
-			.priority = 3};
-	self->homa.gro_policy = HOMA_GRO_FAST_GRANTS;
-	struct sk_buff *result = homa_gro_receive(&self->empty_list,
-			mock_skb_new(&client_ip, &h.common, 0, 0));
-	EXPECT_EQ(EINPROGRESS, -PTR_ERR(result));
-	EXPECT_EQ(12600, srpc->msgout.granted);
-	EXPECT_STREQ("xmit DATA 1400@11200", unit_log_get());
-
-	unit_log_clear();
-	h.offset = htonl(14000);
-	self->homa.gro_policy = 0;
-	struct sk_buff *skb = mock_skb_new(&client_ip, &h.common, 0, 0);
-	result = homa_gro_receive(&self->empty_list, skb);
-	EXPECT_EQ(NULL, result);
-	EXPECT_EQ(12600, srpc->msgout.granted);
-	EXPECT_STREQ("", unit_log_get());
-	kfree_skb(skb);
-}
 TEST_F(homa_offload, homa_gro_receive__HOMA_GRO_SHORT_BYPASS)
 {
 	struct in6_addr client_ip = unit_get_in_addr("196.168.0.1");
@@ -159,7 +126,7 @@ TEST_F(homa_offload, homa_gro_receive__HOMA_GRO_SHORT_BYPASS)
 			.seg = {.offset = htonl(2000),
 			        .segment_length = htonl(1400),
 	                        .ack = {0, 0, 0}}};
-	struct sk_buff *skb, *skb2, *skb3;
+	struct sk_buff *skb, *skb2, *skb3, *skb4;
 
 	struct homa_rpc *srpc = unit_server_rpc(&self->hsk, UNIT_RCVD_ONE_PKT,
 			&client_ip, &server_ip, client_port, server_id, 10000,
@@ -171,24 +138,85 @@ TEST_F(homa_offload, homa_gro_receive__HOMA_GRO_SHORT_BYPASS)
 	skb = mock_skb_new(&self->ip, &h.common, 1400, 2000);
 	struct sk_buff *result = homa_gro_receive(&self->empty_list, skb);
 	EXPECT_EQ(0, -PTR_ERR(result));
-	EXPECT_EQ(8600, srpc->msgin.bytes_remaining);
+	EXPECT_EQ(0, homa_cores[cpu_number]->metrics.gro_data_bypasses);
 
-	/* Second attempt: HOMA_GRO_SHORT_BYPASS enabled but packet too long. */
+	/* Second attempt: HOMA_GRO_SHORT_BYPASS enabled but message longer
+	 * than one packet.
+	 */
 	self->homa.gro_policy |= HOMA_GRO_SHORT_BYPASS;
-	skb2 = mock_skb_new(&self->ip, &h.common, 1400, 3000);
+	homa_cores[cpu_number]->last_gro = 400;
+	skb2 = mock_skb_new(&self->ip, &h.common, 1400, 2000);
 	result = homa_gro_receive(&self->empty_list, skb2);
 	EXPECT_EQ(0, -PTR_ERR(result));
-	EXPECT_EQ(8600, srpc->msgin.bytes_remaining);
+	EXPECT_EQ(0, homa_cores[cpu_number]->metrics.gro_data_bypasses);
 
 	/* Third attempt: bypass should happen. */
-	h.seg.segment_length = htonl(100);
-	skb3 = mock_skb_new(&self->ip, &h.common, 100, 4000);
+	h.message_length = h.seg.segment_length;
+	h.incoming = h.seg.segment_length;
+	homa_cores[cpu_number]->last_gro = 400;
+	skb3 = mock_skb_new(&self->ip, &h.common, 1400, 4000);
 	result = homa_gro_receive(&self->empty_list, skb3);
 	EXPECT_EQ(EINPROGRESS, -PTR_ERR(result));
-	EXPECT_EQ(8500, srpc->msgin.bytes_remaining);
+	EXPECT_EQ(1, homa_cores[cpu_number]->metrics.gro_data_bypasses);
+
+	/* Third attempt: no bypass because core busy. */
+	homa_cores[cpu_number]->last_gro = 600;
+	skb4 = mock_skb_new(&self->ip, &h.common, 1400, 4000);
+	result = homa_gro_receive(&self->empty_list, skb3);
+	EXPECT_EQ(0, -PTR_ERR(result));
+	EXPECT_EQ(1, homa_cores[cpu_number]->metrics.gro_data_bypasses);
 
 	kfree_skb(skb);
 	kfree_skb(skb2);
+	kfree_skb(skb4);
+}
+TEST_F(homa_offload, homa_gro_receive__fast_grant_optimization)
+{
+	struct in6_addr client_ip = unit_get_in_addr("196.168.0.1");
+	struct in6_addr server_ip = unit_get_in_addr("1.2.3.4");
+	int client_port = 40000;
+	__u64 client_id = 1234;
+	__u64 server_id = 1235;
+	struct homa_rpc *srpc = unit_server_rpc(&self->hsk, UNIT_OUTGOING,
+			&client_ip, &server_ip, client_port, server_id, 100,
+			20000);
+	ASSERT_NE(NULL, srpc);
+	homa_xmit_data(srpc, false);
+	unit_log_clear();
+
+	struct grant_header h = {{.sport = htons(srpc->dport),
+	                .dport = htons(self->hsk.port),
+			.sender_id = cpu_to_be64(client_id),
+			.type = GRANT},
+		        .offset = htonl(11000),
+			.priority = 3,
+			.resend_all = 0};
+
+	/* First attempt: HOMA_GRO_FAST_GRANTS not enabled. */
+	self->homa.gro_policy = 0;
+	struct sk_buff *skb = mock_skb_new(&client_ip, &h.common, 0, 0);
+	struct sk_buff *result = homa_gro_receive(&self->empty_list, skb);
+	EXPECT_EQ(0, -PTR_ERR(result));
+	EXPECT_EQ(0, homa_cores[cpu_number]->metrics.gro_grant_bypasses);
+	EXPECT_STREQ("", unit_log_get());
+
+	/* Second attempt: HOMA_FAST_GRANTS is enabled. */
+	self->homa.gro_policy = HOMA_GRO_FAST_GRANTS;
+	homa_cores[cpu_number]->last_gro = 400;
+	struct sk_buff *skb2 = mock_skb_new(&client_ip, &h.common, 0, 0);
+	result = homa_gro_receive(&self->empty_list, skb2);
+	EXPECT_EQ(EINPROGRESS, -PTR_ERR(result));
+	EXPECT_EQ(1, homa_cores[cpu_number]->metrics.gro_grant_bypasses);
+	EXPECT_STREQ("xmit DATA 1400@10000", unit_log_get());
+
+	/* Third attempt: core is too busy for fast grants. */
+	homa_cores[cpu_number]->last_gro = 600;
+	struct sk_buff *skb3 = mock_skb_new(&client_ip, &h.common, 0, 0);
+	result = homa_gro_receive(&self->empty_list, skb3);
+	EXPECT_EQ(0, -PTR_ERR(result));
+	EXPECT_EQ(1, homa_cores[cpu_number]->metrics.gro_grant_bypasses);
+	kfree_skb(skb);
+	kfree_skb(skb3);
 }
 TEST_F(homa_offload, homa_gro_receive__no_held_skb)
 {
@@ -300,11 +328,11 @@ TEST_F(homa_offload, homa_gro_receive__max_gro_skbs)
 	kfree_skb(self->skb);
 }
 
-TEST_F(homa_offload, homa_gro_complete__GRO_IDLE_NEW)
+TEST_F(homa_offload, homa_gro_gen2)
 {
-	homa->gro_policy = HOMA_GRO_IDLE_NEW;
+	homa->gro_policy = HOMA_GRO_GEN2;
 	mock_cycles = 1000;
-	homa->gro_busy_cycles = 100;
+	homa->busy_cycles = 100;
 	cpu_number = 5;
 	atomic_set(&homa_cores[6]->softirq_backlog, 1);
 	homa_cores[6]->last_gro = 0;
@@ -335,6 +363,58 @@ TEST_F(homa_offload, homa_gro_complete__GRO_IDLE_NEW)
 	homa_gro_complete(self->skb, 0);
 	EXPECT_EQ(6, self->skb->hash - 32);
 	EXPECT_EQ(1, homa_cores[5]->softirq_offset);
+}
+
+TEST_F(homa_offload, homa_gro_gen3__basics)
+{
+	homa->gro_policy = HOMA_GRO_GEN3;
+	struct homa_core *core = homa_cores[cpu_number];
+	core->gen3_softirq_cores[0] = 3;
+	core->gen3_softirq_cores[1] = 7;
+	core->gen3_softirq_cores[2] = 5;
+	homa_cores[3]->last_app_active = 4100;
+	homa_cores[7]->last_app_active = 3900;
+	homa_cores[5]->last_app_active = 2000;
+	mock_cycles = 5000;
+	self->homa.busy_cycles = 1000;
+
+	homa_gro_complete(self->skb, 0);
+	EXPECT_EQ(7, self->skb->hash - 32);
+	EXPECT_EQ(0, homa_cores[3]->last_active);
+	EXPECT_EQ(5000, homa_cores[7]->last_active);
+}
+TEST_F(homa_offload, homa_gro_gen3__stop_on_negative_core_id)
+{
+	homa->gro_policy = HOMA_GRO_GEN3;
+	struct homa_core *core = homa_cores[cpu_number];
+	core->gen3_softirq_cores[0] = 3;
+	core->gen3_softirq_cores[1] = -1;
+	core->gen3_softirq_cores[2] = 5;
+	homa_cores[3]->last_app_active = 4100;
+	homa_cores[5]->last_app_active = 2000;
+	mock_cycles = 5000;
+	self->homa.busy_cycles = 1000;
+
+	homa_gro_complete(self->skb, 0);
+	EXPECT_EQ(3, self->skb->hash - 32);
+	EXPECT_EQ(5000, homa_cores[3]->last_active);
+}
+TEST_F(homa_offload, homa_gro_gen3__all_cores_busy_so_pick_first)
+{
+	homa->gro_policy = HOMA_GRO_GEN3;
+	struct homa_core *core = homa_cores[cpu_number];
+	core->gen3_softirq_cores[0] = 3;
+	core->gen3_softirq_cores[1] = 7;
+	core->gen3_softirq_cores[2] = 5;
+	homa_cores[3]->last_app_active = 4100;
+	homa_cores[7]->last_app_active = 4001;
+	homa_cores[5]->last_app_active = 4500;
+	mock_cycles = 5000;
+	self->homa.busy_cycles = 1000;
+
+	homa_gro_complete(self->skb, 0);
+	EXPECT_EQ(3, self->skb->hash - 32);
+	EXPECT_EQ(5000, homa_cores[3]->last_active);
 }
 
 TEST_F(homa_offload, homa_gro_complete__GRO_IDLE)

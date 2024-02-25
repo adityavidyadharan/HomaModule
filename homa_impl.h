@@ -145,10 +145,10 @@ enum homa_packet_type {
 #define HOMA_SKB_EXTRA 40
 
 /**
- * define HOMA_ETH_OVERHEAD - Number of bytes per Ethernet packet for CRC,
- * preamble, and inter-packet gap.
+ * define HOMA_ETH_OVERHEAD - Number of bytes per Ethernet packet for Ethernet
+ * header, CRC, preamble, and inter-packet gap.
  */
-#define HOMA_ETH_OVERHEAD 24
+#define HOMA_ETH_OVERHEAD 42
 
 /**
  * define HOMA_MIN_PKT_LENGTH - Every Homa packet must be padded to at least
@@ -315,7 +315,7 @@ struct data_header {
 	 * bytes in the message up to at least this offset (exclusive),
 	 * even without additional grants. This includes unscheduled
 	 * bytes, granted bytes, plus any additional bytes the sender
-	 * transmits unilaterally (e.g., to send batches, such as with GSO).
+	 * transmits unilaterally (e.g., to round up to a full GSO batch).
 	 */
 	__be32 incoming;
 
@@ -372,6 +372,13 @@ struct grant_header {
 	 * with higher offset. Larger numbers indicate higher priorities.
 	 */
 	__u8 priority;
+
+	/**
+	 * @resend_all: Nonzero means that the sender should resend all previously
+	 * transmitted data, starting at the beginning of the message (assume
+	 * that no packets have been successfully received).
+	 */
+	__u8 resend_all;
 } __attribute__((packed));
 _Static_assert(sizeof(struct grant_header) <= HOMA_MAX_HEADER,
 		"grant_header too large for HOMA_MAX_HEADER; must "
@@ -539,6 +546,12 @@ struct homa_message_out {
 	int num_skbs;
 
 	/**
+	 * @copied_from_user: Number of bytes of the message that have
+	 * been copied from user space into skbs in @packets.
+	 */
+	int copied_from_user;
+
+	/**
 	 * @packets: Singly-linked list of all packets in message, linked
 	 * using homa_next_skb. The list is in order of offset in the message
 	 * (offset 0 first); each sk_buff can potentially contain multiple
@@ -568,8 +581,8 @@ struct homa_message_out {
 	 */
 	atomic_t active_xmits;
 
-	/** @gso_pkt_data: Number of bytes of message data in each packet
-	 * of @packets except possibly the last.
+	/** @gso_pkt_data: Maximum number of bytes of message data that can
+	 * fit in a single outgoing GSO packet.
 	 */
 	int gso_pkt_data;
 
@@ -598,33 +611,48 @@ struct homa_message_out {
 };
 
 /**
+ * struct homa_gap - Represents a range of bytes within a message that have
+ * not yet been received.
+ */
+struct homa_gap {
+	/** @start: offset of first byte in this gap. */
+	int start;
+
+	/** @end: offset of byte just after last one in this gap. */
+	int end;
+
+	/** @links: for linking into list in homa_message_in. */
+	struct list_head links;
+};
+
+/**
  * struct homa_message_in - Holds the state of a message received by
  * this machine; used for both requests and responses.
  */
 struct homa_message_in {
 	/**
-	 * @total_length: Size of the entire message, in bytes. A value
-	 * less than 0 means this structure is uninitialized and therefore
-	 * not in use.
+	 * @length: Payload size in bytes. A value less than 0 means this
+	 * structure is uninitialized and therefore not in use.
 	 */
-	int total_length;
+	int length;
 
 	/**
-	 * @packets: DATA packets received for this message so far. The list
-	 * is sorted in order of offset (head is lowest offset), but
-	 * packets can be received out of order, so there may be times
-	 * when there are holes in the list. Packets in this list contain
-	 * exactly one data_segment. Packets on this list are removed from
-	 * this list and freed once all of their data has been copied
-	 * out to a user buffer.
+	 * @packets: DATA packets for this message that have been received but
+	 * not yet copied to user space (no particular order).
 	 */
 	struct sk_buff_head packets;
 
 	/**
-	 * @num_skbs: Number of buffers currently in @packets. Will be 0 if
-	 * @total_length is less than 0.
+	 * @recv_end: Offset of the byte just after the highest one that
+	 * has been received so far.
 	 */
-	int num_skbs;
+	int recv_end;
+
+	/**
+	 * @gaps: List of homa_gaps describing all of the bytes with
+	 * offsets less than @recv_end that have not yet been received.
+	 */
+	struct list_head gaps;
 
 	/**
 	 * @bytes_remaining: Amount of data for this message that has
@@ -633,13 +661,12 @@ struct homa_message_in {
 	int bytes_remaining;
 
 	/**
-	 * @incoming: Total # of bytes of the message that the sender will
-	 * transmit without additional grants. Initialized to the number of
-	 * unscheduled bytes; after that, updated only when grants are sent.
-	 * Never larger than @total_length. Note: once initialized, this
+	 * @granted: Total # of bytes (starting from offset 0) that the sender
+	 * may transmit without additional grants, includes unscheduled bytes.
+	 * Never larger than @length. Note: once initialized, this
 	 * may not be modified without holding @homa->grantable_lock.
 	 */
-        int incoming;
+        int granted;
 
 	/** @priority: Priority level to include in future GRANTS. */
 	int priority;
@@ -650,17 +677,14 @@ struct homa_message_in {
 	 */
 	bool scheduled;
 
+	/** @resend_all: if nonzero, set resend_all in the next grant packet. */
+	__u8 resend_all;
+
 	/**
 	 * @birth: get_cycles time when this RPC was added to the grantable
 	 * list. Invalid if RPC isn't in the grantable list.
 	 */
 	__u64 birth;
-
-	/**
-	 * @copied_out: All of the bytes of the message with offset less
-	 * than this value have been copied to user-space buffers.
-	 */
-	int copied_out;
 
 	/**
 	 * @num_bpages: The number of entries in @bpage_offsets used for this
@@ -702,6 +726,12 @@ struct homa_interest {
 	int locked;
 
 	/**
+	 * @core: Core on which @thread was executing when it registered
+	 * its interest.  Used for load balancing (see balance.txt).
+	 */
+	int core;
+
+	/**
 	 * @reg_rpc: RPC whose @interest field points here, or
 	 * NULL if none.
 	 */
@@ -731,6 +761,7 @@ static void inline homa_interest_init(struct homa_interest *interest)
 	interest->thread = current;
 	atomic_long_set(&interest->ready_rpc, 0);
 	interest->locked = 0;
+	interest->core = raw_smp_processor_id();
 	interest->reg_rpc = NULL;
 	interest->request_links.next = LIST_POISON1;
 	interest->response_links.next = LIST_POISON1;
@@ -867,9 +898,16 @@ struct homa_rpc {
 
 	/**
 	 * @ready_links: Used to link this object into
-	 * &homa_sock.ready_requests or &homa_sock.ready_responses.
+	 * @hsk->ready_requests or @hsk->ready_responses.
 	 */
 	struct list_head ready_links;
+
+	/**
+	 * @buf_links: Used to link this RPC into @hsk->waiting_for_bufs.
+	 * If the RPC isn't on @hsk->waiting_for_bufs, this is an empty
+	 * list pointing to itself.
+	 */
+	struct list_head buf_links;
 
 	/**
 	 * @active_links: For linking this object into @hsk->active_rpcs.
@@ -888,8 +926,8 @@ struct homa_rpc {
 	struct homa_interest *interest;
 
 	/**
-	 * @grantable_links: Used to link this RPC into peer->grantable_rpcs.
-	 * If this RPC isn't in peer->grantable_rpcs, this is an empty
+	 * @grantable_links: Used to link this RPC into homa->grantable_rpcs.
+	 * If this RPC isn't in homa->grantable_rpcs, this is an empty
 	 * list pointing to itself.
 	 */
 	struct list_head grantable_links;
@@ -944,8 +982,8 @@ struct homa_rpc {
  *         limited conditions. The caller must ensure that the RPC
  *         cannot be reaped before the lock is acquired. It cannot
  *         do that by acquiring the socket lock, since that violates
- *         lock ordering constraints. One approach is to increment
- *         rpc->hsk->reap_disable. Don't use this function unless you
+ *         lock ordering constraints. One approach is to use
+ *         homa_protect_rpcs. Don't use this function unless you
  *         are very sure what you are doing!  See sync.txt for more
  *         info on locking.
  */
@@ -1065,11 +1103,7 @@ struct homa_rpc_bucket {
 
 /**
  * struct homa_bpage - Contains information about a single page in
- * a buffer pool. Note: this information is stored in user memory, so
- * it needs to be managed so that a misbehaving user program can't cause
- * kernel crashes (it's OK if a misbehaving program causes the buffer pool
- * to misbehave, such as running out of space, as long as it doesn't cause
- * a kernel crash).
+ * a buffer pool.
  */
 struct homa_bpage {
 	union {
@@ -1079,17 +1113,14 @@ struct homa_bpage {
 		 */
 		struct homa_cache_line cache_line;
 		struct {
-			/** @lock: to synchronize shared access. Must never
-			 * wait for this lock, since a faulty user program
-			 * could leave it locked.
-			 */
+			/** @lock: to synchronize shared access. */
 			struct spinlock lock;
 
 			/**
-			 * @refs: Number of messages with data in this page.
-			 * The kernel increments this when allocating buffer
-			 * space for a message, and the app decrements it when
-			 * done with a message.
+			 * @refs: Counts number of distinct uses of this
+			 * bpage (1 tick for each message that is using
+			 * this page, plus an additional tick if the @owner
+			 * field is set).
 			 */
 			atomic_t refs;
 
@@ -1102,7 +1133,7 @@ struct homa_bpage {
 			/**
 			 * @expiration: time (in get_cycles units) after
 			 * which it's OK to steal this page from its current
-			 * owner.
+			 * owner (if @refs is 1).
 			 */
 			__u64 expiration;
 		};
@@ -1137,6 +1168,12 @@ struct homa_pool_core {
 			 * from the page.
 			 */
 			int allocated;
+
+			/**
+			 * @next_candidate: when searching for free bpages,
+			 * check this index next.
+			 */
+			int next_candidate;
 		};
 	};
 };
@@ -1152,45 +1189,37 @@ _Static_assert(sizeof(struct homa_pool_core) == sizeof(struct homa_cache_line),
  */
 struct homa_pool {
 	/**
+	 * @hsk: the socket that this pool belongs to.
+	 */
+	struct homa_sock *hsk;
+
+	/**
 	 * @region: beginning of the pool's region (in the app's virtual
-	 * memory). Initial portion is used for bpage metadata shared
-	 * with the application, and the remainder is divided into pages.
-	 * 0 means the pool hasn't yet been initialized.
+	 * memory). Divided into bpages. 0 means the pool hasn't yet been
+	 * initialized.
 	 */
 	char *region;
 
 	/** @num_bpages: total number of bpages in the pool. */
 	int num_bpages;
 
-	/**
-	 * @homa: shared information about the Homa driver.
-	 */
-	struct homa *homa;
-
 	/** @descriptors: kmalloced area containing one entry for each bpage. */
 	struct homa_bpage *descriptors;
 
 	/**
-	 * @active_pages: the number of bpages (always the lowest ones)
-	 * that are currently being used for allocation.  Varies slowly
-	 * depending on active buffer usage. The goal is to keep this
-	 * number small to minimize memory footprint, while keeping it
-	 * large enough so that many pages are free at any given time
-	 * (so allocation is efficient).
+	 * @free_bpages: the number of pages still available for allocation
+	 * by homa_pool_get pages. This equals the number of pages with zero
+	 * reference counts, minus the number of pages that have been claimed
+	 * by homa_get_pool_pages but not yet allocated.
 	 */
-	atomic_t active_pages;
+	atomic_t free_bpages;
 
 	/**
-	 * @next_scan: index of the next page to check while searching for
-	 * a free bpage.
+	 * The number of free bpages required to satisfy the needs of the
+	 * first RPC on @hsk->waiting_for_bufs, or INT_MAX if that queue
+	 * is empty.
 	 */
-	atomic_t next_scan;
-
-	/**
-	 * @free_bpages_found: the number of pages successfully allocated
-	 * so far in the current scan (i.e. since @next_scan was set to 0).
-	 */
-	atomic_t free_bpages_found;
+	int bpages_needed;
 
 	/** @cores: core-specific info; dynamically allocated. */
 	struct homa_pool_core *cores;
@@ -1287,6 +1316,13 @@ struct homa_sock {
 	int dead_skbs;
 
 	/**
+	 * @waiting_for_bufs: Contains RPCs that are blocked because there
+	 * wasn't enough space in the buffer pool region for their incoming
+	 * messages. Sorted in increasing order of message length.
+	 */
+	struct list_head waiting_for_bufs;
+
+	/**
 	 * @ready_requests: Contains server RPCs whose request message is
 	 * in a state requiring attention from  a user process. The head is
 	 * oldest, i.e. next to return.
@@ -1357,7 +1393,7 @@ struct homa_dead_dst {
  * homa_peertab.  Should be large enough to hold an entry for every server
  * in a datacenter without long hash chains.
  */
-#define HOMA_PEERTAB_BUCKET_BITS 20
+#define HOMA_PEERTAB_BUCKET_BITS 16
 
 /** define HOME_PEERTAB_BUCKETS - Number of buckets in a homa_peertab. */
 #define HOMA_PEERTAB_BUCKETS (1 << HOMA_PEERTAB_BUCKET_BITS)
@@ -1445,9 +1481,9 @@ struct homa_peer {
 	struct list_head grantable_rpcs;
 
 	/**
-	 * @grantable_links: Used to link this peer into homa->grantable_peers,
-	 * if there are entries in grantable_rpcs. If grantable_rpcs is empty,
-	 * this is an empty list pointing to itself.
+	 * @grantable_links: Used to link this peer into homa->grantable_rpcs.
+	 * If this RPC is not linked into homa->grantable_rpcs, this is an
+	 * empty list pointing to itself.
 	 */
 	struct list_head grantable_links;
 
@@ -1520,11 +1556,12 @@ struct homa_peer {
  * one of these values.
  */
 enum homa_freeze_type {
-	RESTART_RPC        = 1,
-	PEER_TIMEOUT       = 2,
-	SLOW_RPC           = 3,
-	SOCKET_CLOSE       = 4,
-	PACKET_LOST        = 5,
+	RESTART_RPC            = 1,
+	PEER_TIMEOUT           = 2,
+	SLOW_RPC               = 3,
+	SOCKET_CLOSE           = 4,
+	PACKET_LOST            = 5,
+	NEED_ACK_MISSING_DATA  = 6,
 };
 
 /**
@@ -1552,21 +1589,33 @@ struct homa {
 	atomic64_t link_idle_time __attribute__((aligned(CACHE_LINE_SIZE)));
 
 	/**
-	 * @grantable_lock: Used to synchronize access to @grantable_peers and
-	 * @num_grantable_peers.
+	 * @grantable_lock: Used to synchronize access to @grantable_rpcs and
+	 * @num_grantable_rpcs.
 	 */
 	struct spinlock grantable_lock __attribute__((aligned(CACHE_LINE_SIZE)));
 
 	/**
-	 * @grantable_peers: Contains all homa_peers for which there are
-	 * RPCs that have not been fully granted. The list is sorted in
-	 * priority order (the rpc with the fewest bytes_remaining is the
-	 * first one on the first peer's list).
+	 * @grantable_rpcs: Contains all RPCs that have not been fully
+	 * granted. The list is sorted in priority order (fewer ungranted
+	 * bytes -> higher priority).
 	 */
-	struct list_head grantable_peers;
+	struct list_head grantable_rpcs;
 
-	/** @num_grantable_peers: The number of peers in grantable_peers. */
-	int num_grantable_peers;
+	/** @num_grantable_rpcs: The number of RPCs in grantable_rpcs. */
+	int num_grantable_rpcs;
+
+	/** @last_grantable_change: The get_cycles time of the most recent
+	 * increment or decrement of num_grantable_rpcs; used for computing
+	 * statistics.
+	 */
+	__u64 last_grantable_change;
+
+	/**
+	 * @max_grantable_rpcs: The largest value that has been seen for
+	 * num_grantable_rpcs since this value was reset to 0 (it can be
+	 * reset externally using sysctl).
+	 */
+	int max_grantable_rpcs;
 
 	/**
 	 * @grant_nonfifo: How many bytes should be granted using the
@@ -1668,19 +1717,24 @@ struct homa {
 	struct homa_peertab peers;
 
 	/**
-	 * @rtt_bytes: An estimate of the amount of data that can be transmitted
-         * over the wire in the time it takes to send a full-size data packet
-         * and receive back a grant. Used to ensure full utilization of
-         * uplink bandwidth. Set externally via sysctl.
+	 * @unsched_bytes: The number of bytes that may be sent in a
+	 * new message without receiving any grants. There used to be a
+	 * variable rtt_bytes that served this purpose, and was also used
+	 * for window.  Historically, rtt_bytes was intended to be the amount
+	 * of data that can be transmitted over the wire in the time it
+	 * takes to send a full-size data packet and receive back a grant.
+	 * But, for fast networks that value could result in too much
+	 * buffer utilization (and, we wanted to have separate values for
+	 * @unsched_bytes and @window). Set externally via sysctl.
 	 */
-	int rtt_bytes;
+	int unsched_bytes;
 
 	/**
-	 * @max_grant_window: if nonzero, determines the maximum number
-	 * of granted-but-not-yet-received bytes for a message (may be
-	 * greater than rtt_bytes). This feature is currently for
-	 * experimentation only. Set externally via sysctl.*/
-	int max_grant_window;
+	 * @window: The size of the window for granting (i.e., this many
+	 * unreceived bytes may be granted for a message at any given time).
+	 * If this value is zero, then windows are computed dynamically.
+	 */
+	int window;
 
 	/**
 	 * @link_bandwidth: The raw bandwidth of the network uplink, in
@@ -1759,36 +1813,25 @@ struct homa {
 	int grant_fifo_fraction;
 
 	/**
-	 * @duty_cycle: Sets a limit on the fraction of network bandwidth that
-	 * may be consumed by a single RPC in units of one-thousandth (1000
-	 * means a single RPC can consume all of the incoming network
-	 * bandwidth, 500 means half, and so on). This also determines the
-	 * fraction of a core that can be consumed by NAPI when a large
-	 * message is being received. Its main purpose is to keep NAPI from
-	 * monopolizing a core so much that user threads starve. Set externally
-	 * via sysctl.
-	 */
-	int duty_cycle;
-
-	/**
-	 * @grant_threshold: A grant will not be sent for an RPC until
-	 * the number of incoming bytes drops below this threshold. Computed
-	 * from @rtt_bytes and @duty_cycle.
-	 */
-	int grant_threshold;
-
-	/**
 	 * @max_overcommit: The maximum number of messages to which Homa will
 	 * send grants at any given point in time.  Set externally via sysctl.
 	 */
 	int max_overcommit;
 
 	/**
-	 * @max_incoming: This value is computed from max_overcommit, and
-	 * is the limit on how many bytes are currently permitted to be
-	 * granted but not yet received, cumulative across all messages.
+	 * @max_incoming: Homa will try to ensure that the total number of
+	 * bytes senders have permission to send to this host (either
+	 * unscheduled bytes or granted bytes) does not exceeds this value.
+	 * Set externally via sysctl.
 	 */
 	int max_incoming;
+
+	/**
+	 * @max_rpcs_per_peer: If there are multiple incoming messages from
+	 * the same peer, Homa will only issue grants to this many of them
+	 * at a time.  Set externally via sysctl.
+	 */
+	int max_rpcs_per_peer;
 
 	/**
 	 * @resend_ticks: When an RPC's @silent_ticks reaches this value,
@@ -1911,45 +1954,55 @@ struct homa {
 	/* Bits that can be specified for gro_policy. These were created for
 	 * testing, in order to evaluate various possible policies; you almost
 	 * certainly should not use any value other than HOMA_GRO_NORMAL.
-	 * HOMA_GRO_BYPASS:           Pass all incoming packets directly to
-	 *                            homa_softirq during GRO; this bypasses
-	 *                            the SoftIRQ dispatching mechanism as well
-	 *                            as the network and IP stack layers.
 	 * HOMA_GRO_SAME_CORE         If isolated packets arrive (not part of
 	 *                            a batch) use the GRO core for SoftIRQ also.
 	 * HOMA_GRO_IDLE              Use old mechanism for selecting an idle
 	 *                            core for SoftIRQ (deprecated).
 	 * HOMA_GRO_NEXT              Always use the next core in circular
 	 *                            order for SoftIRQ (deprecated).
-	 * HOMA_GRO_IDLE_NEW          Use the new mechanism for selecting an
+	 * HOMA_GRO_GEN2              Use the new mechanism for selecting an
 	 *                            idle core for SoftIRQ.
-	 * HOMA_GRO_FAST_GRANTS       Pass all grant I can see immediately to
-	 *                            homa_softirq during GRO.
-	 * HOMA_GRO_SHORT_BYPASS      Pass all short packets directly to
-	 *                            homa_softirq during GR).
+	 * HOMA_GRO_FAST_GRANTS       Pass all grants immediately to
+	 *                            homa_softirq during GRO (only if the
+	 *                            core isn't overloaded).
+	 * HOMA_GRO_SHORT_BYPASS      Pass all single-packet messages directly
+	 *                            to homa_softirq during GRO (only if the
+	 *                            core isn't overloaded).
+	 * HOMA_GRO_GEN3              Use the "Gen3" mechanisms for load
+	 *                            balancing.
 	 */
-	#define HOMA_GRO_BYPASS          1
 	#define HOMA_GRO_SAME_CORE       2
 	#define HOMA_GRO_IDLE            4
 	#define HOMA_GRO_NEXT            8
-	#define HOMA_GRO_IDLE_NEW       16
+	#define HOMA_GRO_GEN2           16
 	#define HOMA_GRO_FAST_GRANTS    32
 	#define HOMA_GRO_SHORT_BYPASS   64
-	#define HOMA_GRO_NORMAL      (HOMA_GRO_SAME_CORE|HOMA_GRO_IDLE_NEW \
-			|HOMA_GRO_SHORT_BYPASS)
+	#define HOMA_GRO_GEN3          128
+	#define HOMA_GRO_NORMAL      (HOMA_GRO_SAME_CORE|HOMA_GRO_GEN2 \
+			|HOMA_GRO_SHORT_BYPASS|HOMA_GRO_FAST_GRANTS)
 
 	/*
-	 * @gro_busy_usecs: try not to schedule SoftIRQ processing on a core
-	 * if it has handled Homa packets at GRO level in the last
-	 * gro_busy_us microseconds (improve load balancing by avoiding
-	 * hot spots). Set externally via sysctl.
+	 * @busy_usecs: if there has been activity on a core within the
+	 * last @busy_usecs, it is considered to be busy and Homa will
+	 * try to avoid scheduling other activities on the core. See
+	 * balance.txt for more on load balancing. Set externally via sysctl.
+	 */
+	int busy_usecs;
+
+	/** @busy_cycles: Same as busy_usecs except in get_cycles() units. */
+	int busy_cycles;
+
+	/*
+	 * @gro_busy_usecs: if the gap between the completion of
+	 * homa_gro_receive and the next call to homa_gro_receive on the same
+	 * core is less than this, then GRO on that core is considered to be
+	 * "busy", and optimizations such as HOMA_GRO_SHORT_BYPASS will not be
+	 * done because they risk overloading the core. Set externally via
+	 * sysctl.
 	 */
 	int gro_busy_usecs;
 
-	/**
-	 * @gro_busy_cycles: Same as gro_busy_usecs, except in units
-	 * of get_cycles().
-	 */
+	/** @gro_busy_cycles: Same as busy_usecs except in get_cycles() units. */
 	int gro_busy_cycles;
 
 	/**
@@ -2017,6 +2070,13 @@ struct homa {
 	 * units.
 	 */
 	int bpage_lease_cycles;
+
+	/**
+	 * @next_id: Set via sysctl; causes next_outgoing_id to be set to
+	 * this value; always reads as zero. Typically used while debugging to
+	 * ensure that different nodes use different ranges of ids.
+	 */
+	int next_id;
 
 	/**
 	 * @temp: the values in this array can be read and written with sysctl.
@@ -2127,6 +2187,19 @@ struct homa_metrics {
 	__u64 slow_wakeups;
 
 	/**
+	 * @handoffs_thread_waiting: total number of times that an RPC
+	 * was handed off to a waiting thread (vs. being queued).
+	 */
+	__u64 handoffs_thread_waiting;
+
+	/**
+	 * @handoffs_alt_thread: total number of times that a thread other
+	 * than the first on the list was chosen for a handoff (because the
+	 * first thread was on a busy core).
+	 */
+	__u64 handoffs_alt_thread;
+
+	/**
 	 * @poll_cycles: total time spent in the polling loop in
 	 * homa_wait_for_message, as measured with get_cycles().
 	 */
@@ -2166,12 +2239,13 @@ struct homa_metrics {
 	__u64 napi_cycles;
 
 	/**
-	 * @send_cycles: total time spent executing the homa_ioc_send
-	 * kernel call handler, as measured with get_cycles().
+	 * @send_cycles: total time spent executing the homa_sendmsg kernel
+	 * call handler to send requests, as measured with get_cycles().
 	 */
 	__u64 send_cycles;
 
-	/** @send_calls: total number of invocations of the send kernel call. */
+	/** @send_calls: total number of invocations of homa_semdmsg
+	 * for requests. */
 	__u64 send_calls;
 
 	/**
@@ -2190,12 +2264,15 @@ struct homa_metrics {
 	__u64 blocked_cycles;
 
 	/**
-	 * @reply_cycles: total time spent executing the homa_ioc_reply
-	 * kernel call handler, as measured with get_cycles().
+	 * @reply_cycles: total time spent executing the homa_sendmsg kernel
+	 * call handler to send responses, as measured with get_cycles().
 	 */
 	__u64 reply_cycles;
 
-	/** @reply_calls: total number of invocations of the reply kernel call. */
+	/**
+	 * @reply_calls: total number of invocations of homa_semdmsg
+	 * for responses.
+	 */
 	__u64 reply_calls;
 
 	/**
@@ -2355,11 +2432,16 @@ struct homa_metrics {
 	__u64 short_packets;
 
 	/**
-	 * @redundant_packets: total number of times a packet was discarded
-	 * because all of its they had already been received (perhaps a
-	 * resent packet that turned out to be unnecessary?).
+	 * @packet_discards: total number of times a normal (non-retransmitted)
+	 * packet was discarded because all its data had already been received.
 	 */
-	__u64 redundant_packets;
+	__u64 packet_discards;
+
+	/**
+	 * @resent_discards: total number of times a retransmitted packet
+	 * was discarded because its data had already been received.
+	 */
+	__u64 resent_discards;
 
 	/**
 	 * @resent_packets_used: total number of times a resent packet was
@@ -2500,6 +2582,13 @@ struct homa_metrics {
 	__u64 throttle_list_checks;
 
 	/**
+	 * @grantable_rpcs_integral: cumulative sum of time_delta*grantable,
+	 * where time_delta is a get_cycles time and grantable is the
+	 * value of homa->num_grantable_rpcs over that time period.
+	 */
+	__u64 grantable_rpcs_integral;
+
+	/**
 	 * @fifo_grants: total number of times that grants were sent to
 	 * the oldest message.
 	 */
@@ -2532,6 +2621,52 @@ struct homa_metrics {
 	 */
 	__u64 bpage_reuses;
 
+	/**
+	 * @buffer_alloc_failures: total number of times that
+	 * homa_pool_allocate was unable to allocate buffer space for
+	 * an incoming message.
+	 */
+	__u64 buffer_alloc_failures;
+
+	/**
+	 * @linux_pkt_alloc_bytes: total bytes allocated in new packet buffers
+	 * by the NIC driver because of packet cache underflows.
+	 */
+	__u64 linux_pkt_alloc_bytes;
+
+	/**
+	 * @dropped_data_no_bufs: total bytes of incoming data dropped because
+	 * there was no application buffer space available.
+	 */
+	__u64 dropped_data_no_bufs;
+
+	/**
+	 * @gen3_handoffs: total number of handoffs from GRO to SoftIRQ made
+	 * by Gen3 load balancer.
+	 */
+	__u64 gen3_handoffs;
+
+	/**
+	 * @gen3_alt_handoffs: total number of GRO->SoftIRQ handoffs that
+	 * didn't choose the primary SoftIRQ core because it was busy with
+	 * app threads.
+	 */
+	__u64 gen3_alt_handoffs;
+
+	/**
+	 * @gro_grant_bypasses: total number of GRANT packets passed directly
+	 * to homa_softirq by homa_gro_receive, bypassing the normal SoftIRQ
+	 * mechanism (triggered by HOMA_GRO_FAST_GRANTS).
+	 */
+	__u64 gro_grant_bypasses;
+
+	/**
+	 * @gro_data_bypasses: total number of DATA packets passed directly
+	 * to homa_softirq by homa_gro_receive, bypassing the normal SoftIRQ
+	 * mechanism (triggered by HOMA_GRO_SHORT_BYPASS).
+	 */
+	__u64 gro_data_bypasses;
+
 	/** @temp: For temporary use during testing. */
 #define NUM_TEMP_METRICS 10
 	__u64 temp[NUM_TEMP_METRICS];
@@ -2546,16 +2681,14 @@ struct homa_core {
 	/**
 	 * @last_active: the last time (in get_cycle() units) that
 	 * there was system activity, such NAPI or SoftIRQ, on this
-	 * core. Used to pick a less-busy core for assigning SoftIRQ
-	 * handlers.
+	 * core. Used for load balancing.
 	 */
 	__u64 last_active;
 
 	/**
-	 * @last_gro: the last time (in get_cycle() units) that Homa
-	 * processed packets at GRO(NAPI) level on this core. Used to
-	 * avoid assigning SoftIRQ handlers to this core when it has
-	 * been used recently for GRO.
+	 * @last_gro: the last time (in get_cycle() units) that
+	 * homa_gro_receive returned on this core. Used to determine
+	 * whether GRO is keeping a core busy.
 	 */
 	__u64 last_gro;
 
@@ -2572,6 +2705,23 @@ struct homa_core {
 	 * to produce the core for SoftIRQ.
 	 */
 	int softirq_offset;
+
+	/**
+	 * @gen3_softirq_cores: when the Gen3 load balancer is in use,
+	 * GRO will arrange for SoftIRQ processing to occur on one of
+	 * these cores; -1 values are ignored (see balance.txt for more
+	 * on lewd balancing). This information is filled in via sysctl.
+	 */
+#define NUM_GEN3_SOFTIRQ_CORES 3
+	int gen3_softirq_cores[NUM_GEN3_SOFTIRQ_CORES];
+
+	/**
+	 * @last_app_active: the most recent time (get_cycles() units)
+	 * when an application was actively using Homa on this core (e.g.,
+	 * by sending or receiving messages). Used for load balancing
+	 * (see balance.txt).
+	 */
+	__u64 last_app_active;
 
         /**
          * held_skb: last packet buffer known to be available for
@@ -2622,6 +2772,12 @@ struct homa_skb_info {
 	 * header, CRC, preamble, and inter-packet gap.
 	 */
 	int wire_bytes;
+
+	/**
+	 * @data_bytes: total bytes of message data across all of the
+	 * segments in this packet.
+	 */
+	int data_bytes;
 };
 
 /**
@@ -2659,11 +2815,13 @@ static inline __u64 homa_local_id(__be64 sender_id)
 	return be64_to_cpu(sender_id) ^ 1;
 }
 
-#define homa_bucket_lock(bucket, type)                      \
-	if (unlikely(!spin_trylock_bh(&bucket->lock))) {    \
-		__u64 start = get_cycles();                 \
-		INC_METRIC(type##_lock_misses, 1);        \
-		spin_lock_bh(&bucket->lock);                \
+#define homa_bucket_lock(bucket, type)                                     \
+	if (unlikely(!spin_trylock_bh(&bucket->lock))) {                   \
+		__u64 start = get_cycles();                                \
+		tt_record("beginning wait for " #type " bucket lock");     \
+		INC_METRIC(type##_lock_misses, 1);                         \
+		spin_lock_bh(&bucket->lock);                               \
+		tt_record("ending wait for " #type " bucket lock");        \
 		INC_METRIC(type##_lock_miss_cycles, get_cycles() - start); \
 	}
 
@@ -2983,12 +3141,21 @@ extern void     homa_append_metric(struct homa *homa, const char* format, ...);
 extern int      homa_backlog_rcv(struct sock *sk, struct sk_buff *skb);
 extern int      homa_bind(struct socket *sk, struct sockaddr *addr,
                     int addr_len);
-extern void     homa_check_grantable(struct homa *homa, struct homa_rpc *rpc);
+extern void     homa_check_grantable(struct homa_rpc *rpc);
 extern int      homa_check_rpc(struct homa_rpc *rpc);
 extern int      homa_check_nic_queue(struct homa *homa, struct sk_buff *skb,
                     bool force);
+extern struct homa_rpc
+	       *homa_choose_fifo_grant(struct homa *homa);
+extern struct homa_interest
+               *homa_choose_interest(struct homa *homa, struct list_head *head,
+	            int offset);
+extern int      homa_choose_rpcs_to_grant(struct homa *homa,
+		    struct homa_rpc **rpcs, int max_rpcs);
 extern void     homa_close(struct sock *sock, long timeout);
 extern int      homa_copy_to_user(struct homa_rpc *rpc);
+extern int      homa_create_grants(struct homa *homa, struct homa_rpc **rpcs,
+		    int num_rpcs, struct grant_header *grants, int available);
 extern void     homa_cutoffs_pkt(struct sk_buff *skb, struct homa_sock *hsk);
 extern void     homa_data_from_server(struct sk_buff *skb,
                     struct homa_rpc *crpc);
@@ -3012,14 +3179,17 @@ extern struct homa_rpc
 extern void     homa_free_skbs(struct sk_buff *skb);
 extern void     homa_freeze(struct homa_rpc *rpc, enum homa_freeze_type type,
 		    char *format);
+extern void     homa_freeze_peers(struct homa *homa);
+extern void     homa_gap_new(struct list_head *next, int start, int end);
 extern int      homa_get_port(struct sock *sk, unsigned short snum);
 extern void     homa_get_resend_range(struct homa_message_in *msgin,
                     struct resend_header *resend);
 extern int      homa_getsockopt(struct sock *sk, int level, int optname,
                     char __user *optval, int __user *option);
-extern int      homa_grant_fifo(struct homa *homa);
 extern void     homa_grant_pkt(struct sk_buff *skb, struct homa_rpc *rpc);
 extern int      homa_gro_complete(struct sk_buff *skb, int thoff);
+extern void     homa_gro_gen2(struct sk_buff *skb);
+extern void     homa_gro_gen3(struct sk_buff *skb);
 extern struct sk_buff
                *homa_gro_receive(struct list_head *gro_list,
                     struct sk_buff *skb);
@@ -3035,8 +3205,8 @@ extern int      homa_ioc_abort(struct sock *sk, unsigned long arg);
 extern int      homa_ioctl(struct sock *sk, int cmd, unsigned long arg);
 extern void     homa_log_grantable_list(struct homa *homa);
 extern void     homa_log_throttled(struct homa *homa);
-extern void     homa_message_in_init(struct homa_message_in *msgin, int length,
-		    int incoming);
+extern int      homa_message_in_init(struct homa_rpc *rpc, int length,
+		    int unsched);
 extern int      homa_message_out_init(struct homa_rpc *rpc,
 		    struct iov_iter *iter, int xmit);
 extern loff_t   homa_metrics_lseek(struct file *file, loff_t offset,
@@ -3054,16 +3224,19 @@ extern int      homa_pacer_main(void *transportInfo);
 extern void     homa_pacer_stop(struct homa *homa);
 extern void     homa_pacer_xmit(struct homa *homa);
 extern void     homa_peertab_destroy(struct homa_peertab *peertab);
+extern struct homa_peer **
+		    homa_peertab_get_peers(struct homa_peertab *peertab,
+		    int *num_peers);
 extern int      homa_peertab_init(struct homa_peertab *peertab);
 extern void     homa_peer_add_ack(struct homa_rpc *rpc);
 extern struct homa_peer
                *homa_peer_find(struct homa_peertab *peertab,
-			const struct in6_addr *addr, struct inet_sock *inet);
+		    const struct in6_addr *addr, struct inet_sock *inet);
 extern int      homa_peer_get_acks(struct homa_peer *peer, int count,
 		    struct homa_ack *dst);
 extern struct dst_entry
                *homa_peer_get_dst(struct homa_peer *peer,
-			struct inet_sock *inet);
+		    struct inet_sock *inet);
 extern void     homa_peer_set_cutoffs(struct homa_peer *peer, int c0, int c1,
                     int c2, int c3, int c4, int c5, int c6, int c7);
 extern void     homa_peertab_gc_dsts(struct homa_peertab *peertab, __u64 now);
@@ -3077,8 +3250,8 @@ extern void    *homa_pool_get_buffer(struct homa_rpc *rpc, int offset,
 		    int *available);
 extern int      homa_pool_get_pages(struct homa_pool *pool, int num_pages,
 		    __u32 *pages, int leave_locked);
-extern int      homa_pool_init(struct homa_pool *pool, struct homa *homa,
-		    void *buf_region, __u64 region_size);
+extern int      homa_pool_init(struct homa_sock *hsk, void *buf_region,
+		    __u64 region_size);
 extern void     homa_pool_release_buffers(struct homa_pool *pool,
 		    int num_buffers, __u32 *buffers);
 extern char    *homa_print_ipv4_addr(__be32 addr);
@@ -3091,7 +3264,7 @@ extern void     homa_prios_changed(struct homa *homa);
 extern int      homa_proc_read_metrics(char *buffer, char **start, off_t offset,
                     int count, int *eof, void *data);
 extern int      homa_recvmsg(struct sock *sk, struct msghdr *msg, size_t len,
-                    int noblock, int flags, int *addr_len);
+                    int flags, int *addr_len);
 extern int      homa_register_interests(struct homa_interest *interest,
                     struct homa_sock *hsk, int flags, __u64 id);
 extern void     homa_rehash(struct sock *sk);
@@ -3106,18 +3279,21 @@ extern void     homa_resend_pkt(struct sk_buff *skb, struct homa_rpc *rpc,
                     struct homa_sock *hsk);
 extern void     homa_rpc_abort(struct homa_rpc *crpc, int error);
 extern void     homa_rpc_acked(struct homa_sock *hsk,
-			const struct in6_addr *saddr, struct homa_ack *ack);
+		    const struct in6_addr *saddr, struct homa_ack *ack);
 extern void     homa_rpc_free(struct homa_rpc *rpc);
 extern void     homa_rpc_free_rcu(struct rcu_head *rcu_head);
 extern void     homa_rpc_handoff(struct homa_rpc *rpc);
 extern void     homa_rpc_log(struct homa_rpc *rpc);
+extern void     homa_rpc_log_tt(struct homa_rpc *rpc);
 extern void     homa_rpc_log_active(struct homa *homa, uint64_t id);
+extern void     homa_rpc_log_active_tt(struct homa *homa, int freeze_count);
 extern struct homa_rpc
                *homa_rpc_new_client(struct homa_sock *hsk,
                     const sockaddr_in_union *dest);
 extern struct homa_rpc
                *homa_rpc_new_server(struct homa_sock *hsk,
-			const struct in6_addr *source, struct data_header *h);
+		    const struct in6_addr *source, struct data_header *h,
+		    int *created);
 extern int      homa_rpc_reap(struct homa_sock *hsk, int count);
 extern void     homa_send_grants(struct homa *homa);
 extern int      homa_sendmsg(struct sock *sk, struct msghdr *msg, size_t len);
@@ -3148,6 +3324,8 @@ extern int      homa_softirq(struct sk_buff *skb);
 extern void     homa_spin(int usecs);
 extern char    *homa_symbol_for_state(struct homa_rpc *rpc);
 extern char    *homa_symbol_for_type(uint8_t type);
+extern int      homa_sysctl_softirq_cores(struct ctl_table *table, int write,
+                    void __user *buffer, size_t *lenp, loff_t *ppos);
 extern void     homa_timer(struct homa *homa);
 extern int      homa_timer_main(void *transportInfo);
 extern void     homa_unhash(struct sock *sk);
@@ -3156,6 +3334,7 @@ extern int      homa_unsched_priority(struct homa *homa,
                     struct homa_peer *peer, int length);
 extern int      homa_v4_early_demux(struct sk_buff *skb);
 extern int      homa_v4_early_demux_handler(struct sk_buff *skb);
+extern void     homa_validate_incoming(struct homa *homa, int verbose);
 extern struct homa_rpc
                *homa_wait_for_message(struct homa_sock *hsk, int flags,
                     __u64 id);

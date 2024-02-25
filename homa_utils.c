@@ -57,12 +57,18 @@ int homa_init(struct homa *homa)
 		first = (char *) (((__u64) core_memory + 0x3f) & ~0x3f);
 		for (i = 0; i < nr_cpu_ids; i++) {
 			struct homa_core *core;
+			int j;
+
 			core = (struct homa_core *) (first + i*aligned_size);
 			homa_cores[i] = core;
 			core->last_active = 0;
 			core->last_gro = 0;
 			atomic_set(&core->softirq_backlog, 0);
 			core->softirq_offset = 0;
+			core->gen3_softirq_cores[0] = i^1;
+			for (j = 1; j < NUM_GEN3_SOFTIRQ_CORES; j++)
+				core->gen3_softirq_cores[j] = -1;
+			core->last_app_active = 0;
 			core->held_skb = NULL;
 			core->held_bucket = 0;
 			memset(&core->metrics, 0, sizeof(core->metrics));
@@ -74,8 +80,10 @@ int homa_init(struct homa *homa)
 	atomic64_set(&homa->next_outgoing_id, 2);
 	atomic64_set(&homa->link_idle_time, get_cycles());
 	spin_lock_init(&homa->grantable_lock);
-	INIT_LIST_HEAD(&homa->grantable_peers);
-	homa->num_grantable_peers = 0;
+	INIT_LIST_HEAD(&homa->grantable_rpcs);
+	homa->num_grantable_rpcs = 0;
+	homa->last_grantable_change = get_cycles();
+	homa->max_grantable_rpcs = 0;
 	homa->grant_nonfifo = 0;
 	homa->grant_nonfifo_left = 0;
 	spin_lock_init(&homa->pacer_mutex);
@@ -85,7 +93,7 @@ int homa_init(struct homa *homa)
 	spin_lock_init(&homa->throttle_lock);
 	INIT_LIST_HEAD_RCU(&homa->throttled_rpcs);
 	homa->throttle_add = 0;
-	homa->throttle_min_bytes = 1000;
+	homa->throttle_min_bytes = 200;
 	atomic_set(&homa->total_incoming, 0);
 	homa->next_client_port = HOMA_MIN_DEFAULT_PORT;
 	homa_socktab_init(&homa->port_map);
@@ -97,9 +105,9 @@ int homa_init(struct homa *homa)
 	}
 
 	/* Wild guesses to initialize configuration values... */
-	homa->rtt_bytes = 10000;
-	homa->max_grant_window = 0;
-	homa->link_mbps = 10000;
+	homa->unsched_bytes = 10000;
+	homa->window = 10000;
+	homa->link_mbps = 25000;
 	homa->poll_usecs = 50;
 	homa->num_priorities = HOMA_MAX_PRIORITIES;
 	for (i = 0; i < HOMA_MAX_PRIORITIES; i++)
@@ -119,10 +127,9 @@ int homa_init(struct homa *homa)
 #endif
 	homa->fifo_grant_increment = 10000;
 	homa->grant_fifo_fraction = 50;
-	homa->duty_cycle = 800;
-	homa->grant_threshold = 0;
 	homa->max_overcommit = 8;
-	homa->max_incoming = 0;
+	homa->max_incoming = 400000;
+	homa->max_rpcs_per_peer = 1;
 	homa->resend_ticks = 15;
 	homa->resend_interval = 10;
 	homa->timeout_resends = 5;
@@ -147,7 +154,8 @@ int homa_init(struct homa *homa)
 	homa->max_gro_skbs = 20;
 	homa->gso_force_software = 0;
 	homa->gro_policy = HOMA_GRO_NORMAL;
-	homa->gro_busy_usecs = 10;
+	homa->busy_usecs = 100;
+	homa->gro_busy_usecs = 5;
 	homa->timer_ticks = 0;
 	spin_lock_init(&homa->metrics_lock);
 	homa->metrics = NULL;
@@ -158,6 +166,7 @@ int homa_init(struct homa *homa)
 	homa->freeze_type = 0;
 	homa->sync_freeze = 0;
 	homa->bpage_lease_usecs = 10000;
+	homa->next_id = 0;
 	homa_outgoing_sysctl_changed(homa);
 	homa_incoming_sysctl_changed(homa);
 	return 0;
@@ -230,12 +239,12 @@ struct homa_rpc *homa_rpc_new_client(struct homa_sock *hsk,
 	crpc->dport = ntohs(dest->in6.sin6_port);
 	crpc->completion_cookie = 0;
 	crpc->error = 0;
-	crpc->msgin.total_length = -1;
-	crpc->msgin.num_skbs = 0;
+	crpc->msgin.length = -1;
 	crpc->msgin.num_bpages = 0;
 	memset(&crpc->msgout, 0, sizeof(crpc->msgout));
 	crpc->msgout.length = -1;
 	INIT_LIST_HEAD(&crpc->ready_links);
+	INIT_LIST_HEAD(&crpc->buf_links);
 	INIT_LIST_HEAD(&crpc->dead_links);
 	crpc->interest = NULL;
 	INIT_LIST_HEAD(&crpc->grantable_links);
@@ -274,18 +283,21 @@ error:
  * homa_rpc_new_server() - Allocate and construct a server RPC (one that is
  * used to manage an incoming request). If appropriate, the RPC will also
  * be handed off (we do it here, while we have the socket locked, to avoid
- * acquiring the socket lock a second time).
- * @hsk:    Socket that owns this RPC.
- * @source: IP address (network byte order) of the RPC's client.
- * @h:      Header for the first data packet received for this RPC; used
- *          to initialize the RPC.
+ * acquiring the socket lock a second time later for the handoff).
+ * @hsk:      Socket that owns this RPC.
+ * @source:   IP address (network byte order) of the RPC's client.
+ * @h:        Header for the first data packet received for this RPC; used
+ *            to initialize the RPC.
+ * @created:  Will be set to 1 if a new RPC was created and 0 if an
+ *            existing RPC was found.
  *
  * Return:  A pointer to a new RPC, which is locked, or a negative errno
  *          if an error occurred. If there is already an RPC corresponding
  *          to h, then it is returned instead of creating a new RPC.
  */
 struct homa_rpc *homa_rpc_new_server(struct homa_sock *hsk,
-		const struct in6_addr *source, struct data_header *h)
+		const struct in6_addr *source, struct data_header *h,
+		int *created)
 {
 	int err;
 	struct homa_rpc *srpc = NULL;
@@ -303,6 +315,7 @@ struct homa_rpc *homa_rpc_new_server(struct homa_sock *hsk,
 			/* RPC already exists; just return it instead
 			 * of creating a new RPC.
 			 */
+			*created = 0;
 			return srpc;
 		}
 	}
@@ -327,12 +340,12 @@ struct homa_rpc *homa_rpc_new_server(struct homa_sock *hsk,
 	srpc->id = id;
 	srpc->completion_cookie = 0;
 	srpc->error = 0;
-	srpc->msgin.total_length = -1;
-	srpc->msgin.num_skbs = 0;
+	srpc->msgin.length = -1;
 	srpc->msgin.num_bpages = 0;
 	memset(&srpc->msgout, 0, sizeof(srpc->msgout));
 	srpc->msgout.length = -1;
 	INIT_LIST_HEAD(&srpc->ready_links);
+	INIT_LIST_HEAD(&srpc->buf_links);
 	INIT_LIST_HEAD(&srpc->dead_links);
 	srpc->interest = NULL;
 	INIT_LIST_HEAD(&srpc->grantable_links);
@@ -342,6 +355,12 @@ struct homa_rpc *homa_rpc_new_server(struct homa_sock *hsk,
 	srpc->done_timer_ticks = 0;
 	srpc->magic = HOMA_RPC_MAGIC;
 	srpc->start_cycles = get_cycles();
+	tt_record2("Incoming message for id %d has %d unscheduled bytes",
+			srpc->id, ntohl(h->incoming));
+	err = homa_message_in_init(srpc, ntohl(h->message_length),
+			ntohl(h->incoming));
+	if (err != 0)
+		goto error;
 
 	/* Initialize fields that require socket to be locked. */
 	homa_sock_lock(hsk, "homa_rpc_new_server");
@@ -352,12 +371,13 @@ struct homa_rpc *homa_rpc_new_server(struct homa_sock *hsk,
 	}
 	hlist_add_head(&srpc->hash_links, &bucket->rpcs);
 	list_add_tail_rcu(&srpc->active_links, &hsk->active_rpcs);
-	if (ntohl(h->seg.offset) == 0) {
+	if ((ntohl(h->seg.offset) == 0) && (srpc->msgin.num_bpages > 0)) {
 		atomic_or(RPC_PKTS_READY, &srpc->flags);
 		homa_rpc_handoff(srpc);
 	}
 	homa_sock_unlock(hsk);
 	INC_METRIC(requests_received, 1);
+	*created = 1;
 	return srpc;
 
 error:
@@ -435,7 +455,6 @@ void homa_rpc_acked(struct homa_sock *hsk, const struct in6_addr *saddr,
  */
 void homa_rpc_free(struct homa_rpc *rpc)
 {
-	int delta;
 	if (!rpc || (rpc->state == RPC_DEAD))
 		return;
 
@@ -452,14 +471,8 @@ void homa_rpc_free(struct homa_rpc *rpc)
 	__hlist_del(&rpc->hash_links);
 	list_del_rcu(&rpc->active_links);
 	list_add_tail_rcu(&rpc->dead_links, &rpc->hsk->dead_rpcs);
-	rpc->hsk->dead_skbs += rpc->msgin.num_skbs + rpc->msgout.num_skbs;
-	if (rpc->hsk->dead_skbs > rpc->hsk->homa->max_dead_buffs)
-		/* This update isn't thread-safe; it's just a
-		 * statistic so it's OK if updates occasionally get
-		 * missed.
-		 */
-		rpc->hsk->homa->max_dead_buffs = rpc->hsk->dead_skbs;
 	__list_del_entry(&rpc->ready_links);
+	__list_del_entry(&rpc->buf_links);
 	if (rpc->interest != NULL) {
 		rpc->interest->reg_rpc = NULL;
 		wake_up_process(rpc->interest->thread);
@@ -469,15 +482,28 @@ void homa_rpc_free(struct homa_rpc *rpc)
 //			rpc->hsk->client_port,
 //			rpc->hsk->dead_skbs);
 
-	/* If the RPC had incoming bytes, remove them from the global count. */
-	delta = (rpc->msgin.total_length < 0) ? 0
-			: (rpc->msgin.incoming - (rpc->msgin.total_length
-			- rpc->msgin.bytes_remaining));
-	if (delta != 0)
-		atomic_add(-delta, &rpc->hsk->homa->total_incoming);
-	if (unlikely(rpc->msgin.num_bpages))
-		homa_pool_release_buffers(&rpc->hsk->buffer_pool,
-				rpc->msgin.num_bpages, rpc->msgin.bpage_offsets);
+	if (rpc->msgin.length >= 0) {
+		rpc->hsk->dead_skbs += skb_queue_len(&rpc->msgin.packets);
+		atomic_sub((rpc->msgin.granted - (rpc->msgin.length
+				- rpc->msgin.bytes_remaining)),
+				&rpc->hsk->homa->total_incoming);
+		while (1) {
+			struct homa_gap *gap = list_first_entry_or_null(
+					&rpc->msgin.gaps, struct homa_gap, links);
+			if (gap == NULL) {
+				break;
+			}
+			list_del(&gap->links);
+			kfree(gap);
+		}
+	}
+	rpc->hsk->dead_skbs += rpc->msgout.num_skbs;
+	if (rpc->hsk->dead_skbs > rpc->hsk->homa->max_dead_buffs)
+		/* This update isn't thread-safe; it's just a
+		 * statistic so it's OK if updates occasionally get
+		 * missed.
+		 */
+		rpc->hsk->homa->max_dead_buffs = rpc->hsk->dead_skbs;
 
 	homa_sock_unlock(rpc->hsk);
 	homa_remove_from_throttled(rpc);
@@ -561,7 +587,7 @@ int homa_rpc_reap(struct homa_sock *hsk, int count)
 				}
 			}
 			i = 0;
-			if (rpc->msgin.total_length >= 0) {
+			if (rpc->msgin.length >= 0) {
 				while (1) {
 					struct sk_buff *skb;
 					skb = skb_dequeue(&rpc->msgin.packets);
@@ -569,7 +595,6 @@ int homa_rpc_reap(struct homa_sock *hsk, int count)
 						break;
 					skbs[num_skbs] = skb;
 					num_skbs++;
-					rpc->msgin.num_skbs--;
 					if (num_skbs >= batch_size)
 						goto release;
 				}
@@ -596,14 +621,25 @@ int homa_rpc_reap(struct homa_sock *hsk, int count)
 		for (i = 0; i < num_skbs; i++)
 			kfree_skb(skbs[i]);
 		for (i = 0; i < num_rpcs; i++) {
-			UNIT_LOG("; ", "reaped %llu", rpcs[i]->id);
+			rpc = rpcs[i];
+			UNIT_LOG("; ", "reaped %llu", rpc->id);
 			/* Lock and unlock the RPC before freeing it. This
-			 * is needed to deal with races where the last user
-			 * of the RPC (such as homa_ioc_reply) hasn't
-			 * unlocked it yet.
+			 * is needed to deal with races where the code
+			 * that invoked homa_rpc_free hasn't unlocked the
+			 * RPC yet.
 			 */
-			homa_rpc_lock(rpcs[i]);
-			homa_rpc_unlock(rpcs[i]);
+			homa_rpc_lock(rpc);
+			homa_rpc_unlock(rpc);
+
+			/* This code must be here (not in homa_rpc_free)
+			 * because homa_pool_release_buffers must be called
+			 * without holding any locks.
+			 */
+			if (unlikely(rpc->msgin.num_bpages))
+				homa_pool_release_buffers(
+						&rpc->hsk->buffer_pool,
+						rpc->msgin.num_bpages,
+						rpc->msgin.bpage_offsets);
 			rpcs[i]->state = 0;
 			kfree(rpcs[i]);
 		}
@@ -681,9 +717,9 @@ void homa_rpc_log(struct homa_rpc *rpc)
 		printk(KERN_NOTICE "%s RPC INCOMING, id %llu, peer %s:%d, "
 				"%d/%d bytes received, incoming %d\n",
 				type, rpc->id, peer, rpc->dport,
-				rpc->msgin.total_length
+				rpc->msgin.length
 				- rpc->msgin.bytes_remaining,
-				rpc->msgin.total_length, rpc->msgin.incoming);
+				rpc->msgin.length, rpc->msgin.granted);
 	else if (rpc->state == RPC_OUTGOING) {
 		printk(KERN_NOTICE "%s RPC OUTGOING, id %llu, peer %s:%d, "
 				"out length %d, left %d, granted %d, "
@@ -700,7 +736,7 @@ void homa_rpc_log(struct homa_rpc *rpc)
 				"incoming length %d, outgoing length %d\n",
 				type, homa_symbol_for_state(rpc),
 				rpc->id, peer, rpc->dport,
-				rpc->msgin.total_length, rpc->msgout.length);
+				rpc->msgin.length, rpc->msgout.length);
 	}
 }
 
@@ -737,6 +773,135 @@ void homa_rpc_log_active(struct homa *homa, uint64_t id)
 	}
 	rcu_read_unlock();
 	printk("Finished logging active Homa RPCs: %d active RPCs\n", count);
+}
+
+/**
+ * homa_rpc_log_tt() - Log info about a particular RPC using timetraces.
+ * @rpc:  RPC for which key info should be written to the system log.
+ */
+void homa_rpc_log_tt(struct homa_rpc *rpc)
+{
+	if (rpc->state == RPC_INCOMING) {
+		int received = rpc->msgin.length
+				- rpc->msgin.bytes_remaining;
+		tt_record4("Incoming RPC id %d, peer 0x%x, %d/%d bytes "
+				"received",
+				rpc->id, tt_addr(rpc->peer->addr),
+				received, rpc->msgin.length);
+		if (rpc->msgin.granted > received)
+			tt_record3("RPC id %d has %d outstanding grants "
+					"(incoming %d)", rpc->id,
+					rpc->msgin.granted - received,
+					rpc->msgin.granted);
+		if (rpc->msgin.num_bpages == 0)
+			tt_record1("RPC id %d is blocked waiting for buffers",
+					rpc->id);
+	} else if (rpc->state == RPC_OUTGOING) {
+		tt_record4("Outgoing RPC id %d, peer 0x%x, %d/%d bytes "
+				"sent",
+				rpc->id, tt_addr(rpc->peer->addr),
+				rpc->msgout.next_xmit_offset,
+				rpc->msgout.length);
+		if (rpc->msgout.granted > rpc->msgout.next_xmit_offset)
+			tt_record3("RPC id %d has %d unsent grants (granted %d)",
+					rpc->id, rpc->msgout.granted
+					- rpc->msgout.next_xmit_offset,
+					rpc->msgout.granted);
+	} else {
+		tt_record2("RPC id %d is in state %d", rpc->id, rpc->state);
+	}
+}
+
+/**
+ * homa_rpc_log_active_tt() - Log information about all active RPCs using
+ * timetraces.
+ * @homa:    Overall data about the Homa protocol implementation.
+ * @freeze_count:  If nonzero, FREEZE requests will be sent for this many
+ *                 incoming RPCs with outstanding grants
+ */
+void homa_rpc_log_active_tt(struct homa *homa, int freeze_count)
+{
+	struct homa_socktab_scan scan;
+	struct homa_sock *hsk;
+	struct homa_rpc *rpc;
+	int count = 0;
+
+	tt_record("Logging active Homa RPCs:");
+	rcu_read_lock();
+	for (hsk = homa_socktab_start_scan(&homa->port_map, &scan);
+			hsk !=  NULL; hsk = homa_socktab_next(&scan)) {
+		if (list_empty(&hsk->active_rpcs) || hsk->shutdown)
+			continue;
+
+		if (!homa_protect_rpcs(hsk))
+			continue;
+		list_for_each_entry_rcu(rpc, &hsk->active_rpcs, active_links) {
+			struct freeze_header freeze;
+			count++;
+			homa_rpc_log_tt(rpc);
+			if (freeze_count == 0) {
+				continue;
+			}
+			if (rpc->state != RPC_INCOMING)
+				continue;
+			if (rpc->msgin.granted <= (rpc->msgin.length
+					- rpc->msgin.bytes_remaining))
+				continue;
+			freeze_count--;
+			printk(KERN_NOTICE "Emitting FREEZE in homa_rpc_log_active_tt\n");
+			homa_xmit_control(FREEZE, &freeze, sizeof(freeze), rpc);
+		}
+		homa_unprotect_rpcs(hsk);
+	}
+	rcu_read_unlock();
+	tt_record1("Finished logging %d active Homa RPCs", count);
+}
+
+/**
+ * homa_validate_incoming() - Scan all of the active RPCs to compute what
+ * homa_total_incoming should be, and see if it actually matches..
+ * @homa:    Overall data about the Homa protocol implementation.
+ * @verbose: Print incoming info for each individual RPC.
+ */
+void homa_validate_incoming(struct homa *homa, int verbose)
+{
+	struct homa_socktab_scan scan;
+	struct homa_sock *hsk;
+	struct homa_rpc *rpc;
+	int total_incoming = 0;
+
+	rcu_read_lock();
+	for (hsk = homa_socktab_start_scan(&homa->port_map, &scan);
+			hsk !=  NULL; hsk = homa_socktab_next(&scan)) {
+		if (list_empty(&hsk->active_rpcs) || hsk->shutdown)
+			continue;
+
+		if (!homa_protect_rpcs(hsk))
+			continue;
+		list_for_each_entry_rcu(rpc, &hsk->active_rpcs, active_links) {
+			int incoming;
+			if (rpc->state != RPC_INCOMING)
+				continue;
+			incoming = rpc->msgin.granted -
+					(rpc->msgin.length
+					- rpc->msgin.bytes_remaining);
+			if (incoming == 0)
+				continue;
+			total_incoming += incoming;
+			if (verbose)
+				tt_record4("homa_validate_incoming: RPC id %d, "
+						"granted %d, remaining %d, "
+						"incoming %d",
+						rpc->id, rpc->msgin.granted,
+						rpc->msgin.bytes_remaining,
+						incoming);
+		}
+		homa_unprotect_rpcs(hsk);
+	}
+	rcu_read_unlock();
+	tt_record2("homa_validate_incoming computed total incoming %d, "
+			"homa->total_incoming %d",
+			total_incoming, atomic_read(&homa->total_incoming));
 }
 
 /**
@@ -880,9 +1045,10 @@ char *homa_print_packet(struct sk_buff *skb, char *buffer, int buf_len)
 	}
 	case GRANT: {
 		struct grant_header *h = (struct grant_header *) skb->data;
+		char *resend = (h->resend_all) ? ", resend_all" : "";
 		used = homa_snprintf(buffer, buf_len, used,
-				", offset %d, grant_prio %u",
-				ntohl(h->offset), h->priority);
+				", offset %d, grant_prio %u%s",
+				ntohl(h->offset), h->priority, resend);
 		break;
 	}
 	case RESEND: {
@@ -978,8 +1144,9 @@ char *homa_print_packet_short(struct sk_buff *skb, char *buffer, int buf_len)
 	}
 	case GRANT: {
 		struct grant_header *h = (struct grant_header *) common;
-		snprintf(buffer, buf_len, "GRANT %d@%d", ntohl(h->offset),
-				h->priority);
+		char *resend = h->resend_all ? " resend_all" : "";
+		snprintf(buffer, buf_len, "GRANT %d@%d%s", ntohl(h->offset),
+				h->priority, resend);
 		break;
 	}
 	case RESEND: {
@@ -1014,6 +1181,45 @@ char *homa_print_packet_short(struct sk_buff *skb, char *buffer, int buf_len)
 		break;
 	}
 	return buffer;
+}
+
+/**
+ * homa_freeze_peers() - Send FREEZE packets to all known peers.
+ * @homa:   Provides info about peers.
+ */
+void homa_freeze_peers(struct homa *homa)
+{
+	struct homa_peer **peers;
+	int num_peers, i, err;
+	struct freeze_header freeze;
+	struct homa_sock *hsk;
+	struct homa_socktab_scan scan;
+
+	/* Find a socket to use (any will do). */
+	hsk = homa_socktab_start_scan(&homa->port_map, &scan);
+	if (hsk == NULL) {
+		printk(KERN_NOTICE "homa_freeze_peers couldn't find a socket\n");
+		return;
+	}
+
+	peers = homa_peertab_get_peers(&homa->peers, &num_peers);
+	if (peers == NULL) {
+		printk(KERN_NOTICE "homa_freeze_peers couldn't find peers "
+				"to freeze\n");
+		return;
+	}
+	freeze.common.type = FREEZE;
+	freeze.common.sport = htons(hsk->port);;
+	freeze.common.dport = 0;
+	freeze.common.sender_id = 0;
+	for (i = 0; i < num_peers; i++) {
+		err = __homa_xmit_control(&freeze, sizeof(freeze), peers[i], hsk);
+		if (err != 0)
+			printk(KERN_NOTICE "homa_freeze_peers got error %d "
+					"in xmit to %s\n", err,
+					homa_print_ipv6_addr(&peers[i]->addr));
+	}
+	kfree(peers);
 }
 
 /**
@@ -1199,6 +1405,7 @@ char *homa_print_metrics(struct homa *homa)
 			cpu_khz);
 	for (core = 0; core < nr_cpu_ids; core++) {
 		struct homa_metrics *m = &homa_cores[core]->metrics;
+		__s64 delta;
 		homa_append_metric(homa,
 				"core                      %15d  "
 				"Core id for following metrics\n",
@@ -1288,6 +1495,15 @@ char *homa_print_metrics(struct homa *homa)
 				"Messages received after thread went to sleep\n",
 				m->slow_wakeups);
 		homa_append_metric(homa,
+				"handoffs_thread_waiting   %15llu  "
+				"RPC handoffs to waiting threads (vs. queue)\n",
+				m->handoffs_thread_waiting);
+		homa_append_metric(homa,
+				"handoffs_alt_thread       %15llu  "
+				"RPC handoffs not to first on list (avoid busy "
+				"core)\n",
+				m->handoffs_alt_thread);
+		homa_append_metric(homa,
 				"poll_cycles               %15llu  "
 				"Time spent polling for incoming messages\n",
 				m->poll_cycles);
@@ -1315,16 +1531,26 @@ char *homa_print_metrics(struct homa *homa)
 				m->napi_cycles);
 		homa_append_metric(homa,
 				"send_cycles               %15llu  "
-				"Time spent in homa_ioc_send kernel call\n",
+				"Time spent in homa_sendmsg for requests\n",
 				m->send_cycles);
 		homa_append_metric(homa,
 				"send_calls                %15llu  "
-				"Total invocations of send kernel call\n",
+				"Total invocations of homa_sendmsg for "
+				"requests\n",
 				m->send_calls);
+		// It is possible for us to get here at a time when a
+		// thread has been blocked for a long time and has
+		// recorded blocked_cycles, but hasn't finished the
+		// system call so recv_cycles hasn't been incremented
+		// yet. If that happens, just record 0 to prevent
+		// underflow errors.
+		delta = m->recv_cycles - m->blocked_cycles;
+		if (delta < 0)
+			delta = 0;
 		homa_append_metric(homa,
 				"recv_cycles               %15llu  "
 				"Unblocked time spent in recvmsg kernel call\n",
-				m->recv_cycles - m->blocked_cycles);
+				delta);
 		homa_append_metric(homa,
 				"recv_calls                %15llu  "
 				"Total invocations of recvmsg kernel call\n",
@@ -1335,11 +1561,12 @@ char *homa_print_metrics(struct homa *homa)
 				m->blocked_cycles);
 		homa_append_metric(homa,
 				"reply_cycles              %15llu  "
-				"Time spent in homa_ioc_reply kernel call\n",
+				"Time spent in homa_sendmsg for responses\n",
 				m->reply_cycles);
 		homa_append_metric(homa,
 				"reply_calls               %15llu  "
-				"Total invocations of reply kernel call\n",
+				"Total invocations of homa_sendmsg for "
+				"responses\n",
 				m->reply_calls);
 		homa_append_metric(homa,
 				"abort_cycles              %15llu  "
@@ -1455,14 +1682,18 @@ char *homa_print_metrics(struct homa *homa)
 				"Packets discarded because too short\n",
 				m->short_packets);
 		homa_append_metric(homa,
-				"redundant_packets         %15llu  "
-				"Packets discarded because data already "
-				"received\n",
-				m->redundant_packets);
+				"packet_discards           %15llu  "
+				"Non-resent packets discarded because data "
+				"already received\n",
+				m->packet_discards);
+		homa_append_metric(homa,
+				"resent_discards           %15llu  "
+				"Resent packets discarded because data "
+				"already received\n",
+				m->resent_discards);
 		homa_append_metric(homa,
 				"resent_packets_used       %15llu  "
-				"Retransmitted packets that were actually "
-				"needed\n",
+				"Retransmitted packets that were actually used\n",
 				m->resent_packets_used);
 		homa_append_metric(homa,
 				"peer_timeouts             %15llu  "
@@ -1556,6 +1787,10 @@ char *homa_print_metrics(struct homa *homa)
 				"homa_add_to_throttled\n",
 				m->throttle_list_checks);
 		homa_append_metric(homa,
+				"grantable_rpcs_integral   %15llu  "
+				"Integral of homa->num_grantable_rpcs*dt\n",
+				m->grantable_rpcs_integral);
+		homa_append_metric(homa,
 				"fifo_grants               %15llu  "
 				"Grants issued using FIFO priority\n",
 				m->fifo_grants);
@@ -1579,6 +1814,39 @@ char *homa_print_metrics(struct homa *homa)
 				"Buffer page could be reused because ref "
 				"count was zero\n",
 				m->bpage_reuses);
+		homa_append_metric(homa,
+				"buffer_alloc_failures     %15llu  "
+				"homa_pool_allocate didn't find enough buffer "
+				"space for an RPC\n",
+				m->buffer_alloc_failures);
+		homa_append_metric(homa,
+				"linux_pkt_alloc_bytes     %15llu  "
+				"Bytes allocated in new packets by NIC driver "
+				"due to cache overflows\n",
+				m->linux_pkt_alloc_bytes);
+		homa_append_metric(homa,
+				"dropped_data_no_bufs     %15llu  "
+				"Data bytes dropped because app buffers full\n",
+				m->dropped_data_no_bufs);
+		homa_append_metric(homa,
+				"gen3_handoffs            %15llu  "
+				"GRO->SoftIRQ handoffs made by Gen3 balancer\n",
+				m->gen3_handoffs);
+		homa_append_metric(homa,
+				"gen3_alt_handoffs        %15llu  "
+				"Gen3 handoffs to secondary core (primary was "
+				"busy)\n",
+				m->gen3_alt_handoffs);
+		homa_append_metric(homa,
+				"gro_grant_bypasses       %15llu  "
+				"Grant packets passed directly to homa_softirq "
+				"by homa_gro_receive\n",
+				m->gro_grant_bypasses);
+		homa_append_metric(homa,
+				"gro_data_bypasses        %15llu  "
+				"Data packets passed directly to homa_softirq "
+				"by homa_gro_receive\n",
+				m->gro_data_bypasses);
 		for (i = 0; i < NUM_TEMP_METRICS;  i++)
 			homa_append_metric(homa,
 					"temp%-2d                  %15llu  "
@@ -1701,10 +1969,17 @@ void homa_freeze(struct homa_rpc *rpc, enum homa_freeze_type type, char *format)
 {
 	if (type != rpc->hsk->homa->freeze_type)
 		return;
+	rpc->hsk->homa->freeze_type = 0;
 	if (!tt_frozen) {
-		struct freeze_header freeze;
+//		struct freeze_header freeze;
+		printk(KERN_NOTICE "freezing in homa_freeze with freeze_type %d\n", type);
+		tt_record1("homa_freeze calling homa_rpc_log_active with freeze_type %d", type);
+		homa_rpc_log_active_tt(rpc->hsk->homa, 0);
+		homa_validate_incoming(rpc->hsk->homa, 1);
+		printk(KERN_NOTICE "%s\n", format);
 		tt_record2(format, rpc->id, tt_addr(rpc->peer->addr));
 		tt_freeze();
-		homa_xmit_control(FREEZE, &freeze, sizeof(freeze), rpc);
+//		homa_xmit_control(FREEZE, &freeze, sizeof(freeze), rpc);
+		homa_freeze_peers(rpc->hsk->homa);
 	}
 }

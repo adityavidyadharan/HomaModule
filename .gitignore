@@ -12,11 +12,14 @@
 .tags*
 .deps
 *.pdf
-*.cmd
-*.d
+*.tt
+*.out
 
 # Ignore IDE files
 /.idea/
 /nbproject/
 
 reports/
+traces/
+bytedance/
+saved_traces/

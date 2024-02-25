@@ -66,7 +66,6 @@ uint32_t client_max = 1;
 uint32_t client_port_max = 1;
 int client_ports = 0;
 int first_port = 4000;
-int first_server = 1;
 bool is_server = false;
 int id = -1;
 double net_gbps = 0.0;
@@ -75,8 +74,7 @@ bool one_way = false;
 int port_receivers = 1;
 int port_threads = 1;
 std::string protocol_string;
-const char *protocol;
-int server_nodes = 1;
+const char *protocol = "homa";
 int server_ports = 1;
 bool verbose = false;
 std::string workload_string;
@@ -86,6 +84,10 @@ bool client_iovec = false;
 bool server_iovec = false;
 int inet_family = AF_INET;
 int server_core = -1;
+int buf_bpages = 1000;
+
+/* Node ids for clients to send requests to. */
+std::vector<int> server_ids;
 
 /** @rand_gen: random number generator. */
 static std::mt19937 rand_gen(
@@ -138,10 +140,10 @@ struct conn_id {
 std::vector<sockaddr_in_union> server_addrs;
 
 /**
- * @server_ids: for each entry in @server_addrs, a connection identifier
+ * @server_conns: for each entry in @server_addrs, a connection identifier
  * with all fields filled in except client_port, which will be 0.
  */
-std::vector<conn_id> server_ids;
+std::vector<conn_id> server_conns;
 
 /**
  * @freeze: one entry for each node index; 1 means messages to that
@@ -279,66 +281,82 @@ void print_help(const char *name)
 		"lines from standard input and executing them as commands. The following\n"
 		"commands are supported, each followed by a list of options supported\n"
 		"by that command:\n\n"
-		"client [options]      Start one or more client threads\n"
-		"    --client-max      Maximum number of outstanding requests from a single\n"
+	        "client [options]      Start one or more client threads\n");
+	printf("    --buf-bpages      Number of bpages to allocate in the buffer poool for\n"
+		"                      incoming messages (default: %d)\n",
+			buf_bpages);
+	printf("    --client-max      Maximum number of outstanding requests from a single\n"
 		"                      client machine (divided equally among client ports)\n"
-		"                      (default: %d)\n"
-		"    --first-port      Lowest port number to use for each server (default: %d)\n"
-		"    --first-server    Id of first server node (default: %d, meaning node%d)\n"
-		"    --gbps            Target network utilization, including only message data,\n"
-		"                      Gbps; 0 means send continuously (default: %.1f)\n"
-		"    --id              Id of this node; a value of I >= 0 means requests will\n"
-		"                      not be sent to nodeI (default: -1)\n"
-                "    --iovec           Use homa_sendv instead of homa_send\n"
-                "    --ipv6            Use IPv6 instead of IPv4\n"
-		"    --no-trunc        For TCP, allow messages longer than Homa's limit\n"
-		"    --one-way         Make all response messages 100 B, instead of the same\n"\
-		"                      size as request messages\n"
-		"    --ports           Number of ports on which to send requests (one\n"
-		"                      sending thread per port (default: %d)\n"
-		"    --port-receivers  Number of threads to listen for responses on each\n"
+		"                      (default: %d)\n", client_max);
+	printf("    --first-port      Lowest port number to use for each server (default: %d)\n",
+			first_port);
+	printf("    --first-server    Id of first server node (default: 1, meaning node1)\n");
+	printf("    --gbps            Target network utilization, including only message data,\n"
+		"                      Gbps; 0 means send continuously (default: %.1f)\n",
+			net_gbps);
+	printf("    --id              Id of this node; a value of I >= 0 means requests will\n"
+		"                      not be sent to nodeI (default: -1)\n");
+        printf("    --ipv6            Use IPv6 instead of IPv4\n");
+	printf("    --no-trunc        For TCP, allow messages longer than Homa's limit\n");
+	printf("    --one-way         Make all response messages 100 B, instead of the same\n"\
+		"                      size as request messages\n");
+	printf("    --ports           Number of ports on which to send requests (one\n"
+		"                      sending thread per port (default: %d)\n",
+		client_ports);
+	printf("    --port-receivers  Number of threads to listen for responses on each\n"
 		"                      port (default: %d). Zero means senders wait for their\n"
-		"                      own requests synchronously\n"
-		"    --protocol        Transport protocol to use: homa or tcp (default: %s)\n"
-		"    --server-nodes    Number of nodes running server threads (default: %d)\n"
-		"    --server-ports    Number of server ports on each server node\n"
-		"                      (default: %d)\n"
-		"    --unloaded        Nonzero means run test in special mode for collecting\n"
+		"                      own requests synchronously\n",
+			port_receivers);
+	printf("    --protocol        Transport protocol to use: homa or tcp (default: %s)\n",
+			protocol);
+	printf("    --server-nodes    Number of nodes running server threads (default: 1)\n");
+	printf("    --server-ports    Number of server ports on each server node\n"
+		"                      (default: %d)\n",
+			server_ports);
+	printf("    --servers         Comma-separated list of integer ids to use as server\n");
+	printf("                      nodes; if specified, overrides --first-server and\n"
+		"                      --server-nodes\n");
+	printf("    --unloaded        Nonzero means run test in special mode for collecting\n"
 		"                      baseline data, with the given number of measurements\n"
-		"                      per length in the distribution (Homa only, default: 0)\n"
-		"    --workload        Name of distribution for request lengths (e.g., 'w1')\n"
-		"                      or integer for fixed length (default: %s)\n\n"                "debug value value ... Set one or more int64_t values that may be used for\n"
-		"                      various debugging purposes\n\n"
-		"dump_times file       Log RTT times (and lengths) to file\n\n"
-		"exit                  Exit the application\n\n"
-		"log [options] [msg]   Configure logging as determined by the options. If\n"
+		"                      per length in the distribution (Homa only, default: 0)\n");
+	printf("    --workload        Name of distribution for request lengths (e.g., 'w1')\n"
+		"                      or integer for fixed length (default: %s)\n\n",
+			workload);
+	printf("debug value value ... Set one or more int64_t values that may be used for\n"
+		"                      various debugging purposes\n\n");
+	printf("dump_times file       Log RTT times (and lengths) to file\n\n");
+	printf("exit                  Exit the application\n\n");
+	printf("log [options] [msg]   Configure logging as determined by the options. If\n"
 		"                      there is an \"option\" that doesn't start with \"--\",\n"
 		"                      then it and all of the remaining words are printed to\n"
-		"                      the log as a message.\n"
-		"    --file            Name of log file to use for future messages (\"-\"\n"
-		"                      means use standard output)\n"
-		"    --level           Log level: either normal or verbose\n\n"
-		"server [options]      Start serving requests on one or more ports\n"
-		"    --first-port      Lowest port number to use (default: %d)\n"
-                "    --iovec           Use homa_replyv instead of homa_reply\n"
-                "    --ipv6            Use IPv6 instead of IPv4\n"
-		"    --pin             All server threads will be restricted to run only\n"
-	        "                      on the givevn core\n"
-		"    --protocol        Transport protocol to use: homa or tcp (default: %s)\n"
-		"    --port-threads    Number of server threads to service each port\n"
-		"                      (Homa only, default: %d)\n"
-		"    --ports           Number of ports to listen on (default: %d)\n\n"
-		"stop [options]        Stop existing client and/or server threads; each\n"
-		"                      option must be either 'clients' or 'servers'\n\n"
-		" tt [options]         Manage time tracing:\n"
-		"     freeze           Stop recording time trace information until\n"
-		"                      print has been invoked\n"
-		"     kfreeze          Freeze the kernel's internal timetrace\n"
-		"     print file       Dump timetrace information to file\n",
-		client_max, first_port, first_server, first_server, net_gbps,
-		client_ports, port_receivers, protocol,
-		server_nodes, server_ports, workload,
-		first_port, protocol, port_threads, server_ports);
+		"                      the log as a message.\n");
+	printf("    --file            Name of log file to use for future messages (\"-\"\n"
+		"                      means use standard output)\n");
+	printf("    --level           Log level: either normal or verbose\n\n");
+	printf("server [options]      Start serving requests on one or more ports\n");
+	printf("    --buf-bpages      Number of bpages to allocate in the buffer poool for\n"
+		"                      incoming messages (default: %d)\n",
+			buf_bpages);
+	printf("    --first-port      Lowest port number to use (default: %d)\n",
+			first_port);
+	printf("    --iovec           Use homa_replyv instead of homa_reply\n");
+	printf("    --ipv6            Use IPv6 instead of IPv4\n");
+	printf("    --pin             All server threads will be restricted to run only\n"
+	        "                      on the givevn core\n");
+	printf("    --protocol        Transport protocol to use: homa or tcp (default: %s)\n",
+			protocol);
+	printf("    --port-threads    Number of server threads to service each port\n"
+		"                      (Homa only, default: %d)\n",
+			port_threads);
+	printf("    --ports           Number of ports to listen on (default: %d)\n\n",
+			server_ports);
+	printf("stop [options]        Stop existing client and/or server threads; each\n"
+		"                      option must be either 'clients' or 'servers'\n\n");
+	printf(" tt [options]         Manage time tracing:\n");
+	printf("     freeze           Stop recording time trace information until\n"
+		"                      print has been invoked\n");
+	printf("     kfreeze          Freeze the kernel's internal timetrace\n");
+	printf("     print file       Dump timetrace information to file\n");
 }
 
 /**
@@ -501,11 +519,10 @@ struct message_header {
 void init_server_addrs(void)
 {
 	server_addrs.clear();
-	server_ids.clear();
+	server_conns.clear();
 	freeze.clear();
 	first_id.clear();
-	for (int node = first_server; node < first_server + server_nodes;
-			node++) {
+	for (int node: server_ids) {
 		char host[100];
 		struct addrinfo hints;
 		struct addrinfo *matching_addresses;
@@ -533,7 +550,7 @@ void init_server_addrs(void)
 		for (int thread = 0; thread < server_ports; thread++) {
 			dest->in4.sin_port = htons(first_port + thread);
 			server_addrs.push_back(*dest);
-			server_ids.emplace_back(node, thread, id, 0);
+			server_conns.emplace_back(node, thread, id, 0);
 		}
 		while (((int) freeze.size()) <= node)
 			freeze.push_back(0);
@@ -739,6 +756,19 @@ int tcp_connection::read(bool loop,
 
 		}
 
+		if ((count >= 4) && (strncmp(buffer, "GET ", 4) == 0)) {
+			/* It looks like someone is trying to make an HTTP
+			 * connection to us; that's bogus.
+			 */
+			log(NORMAL, "ERROR: unexpected data received from "
+					"%s: %.*s\n", print_address(&peer),
+					count, buffer);
+			snprintf(error_message, sizeof(error_message),
+					"Unexpected data received from %s",
+					print_address(&peer));
+			return 1;
+		}
+
 		/*
 		 * Process incoming bytes (could contains parts of multiple
 		 * requests). The first 4 bytes of each request give its
@@ -770,8 +800,22 @@ int tcp_connection::read(bool loop,
 				}
 			}
 
-			/* At this point we know the request length, so read until
-			 * we've got a full request.
+			if ((header.length > HOMA_MAX_MESSAGE_LENGTH)
+					|| (header.length < 0)) {
+				log(NORMAL, "ERROR: invalid message length %d "
+						"from %s, closing connection\n",
+						header.length,
+						print_address(&peer));
+				snprintf(error_message, sizeof(error_message),
+						"Invalid message length %d "
+						"from %s",
+						header.length,
+						print_address(&peer));
+				return 1;
+			}
+
+			/* At this point we know the request length, so read
+			 * until we've got a full request.
 			 */
 			int needed = header.length - bytes_received;
 			if (count < needed) {
@@ -1011,7 +1055,7 @@ homa_server::homa_server(int port, int id, int inet_family,
 	}
 	log(NORMAL, "Successfully bound to Homa port %d\n", port);
 
-	buf_size = 1000*HOMA_BPAGE_SIZE;
+	buf_size = buf_bpages*HOMA_BPAGE_SIZE;
 	buf_region = (char *) mmap(NULL, buf_size, PROT_READ|PROT_WRITE,
 			MAP_PRIVATE|MAP_ANONYMOUS, 0, 0);
 	if (buf_region == MAP_FAILED) {
@@ -1043,6 +1087,7 @@ homa_server::homa_server(int port, int id, int inet_family,
  */
 homa_server::~homa_server()
 {
+	log(NORMAL, "Homa server on port %d shutting down\n", port);
 	shutdown(fd, SHUT_RDWR);
 	for (std::thread &thread: threads)
 		thread.join();
@@ -1078,8 +1123,12 @@ void homa_server::server(int thread_id, server_metrics *metrics)
 			length = receiver.receive(HOMA_RECVMSG_REQUEST, 0);
 			if (length >= 0)
 				break;
-			if ((errno == EBADF) || (errno == ESHUTDOWN))
+			if ((errno == EBADF) || (errno == ESHUTDOWN)) {
+				log(NORMAL, "Homa server thread %s exiting "
+						"(socket closed)\n",
+						thread_name);
 				return;
+			}
 			else if ((errno != EINTR) && (errno != EAGAIN))
 				log(NORMAL, "recvmsg failed: %s\n",
 						strerror(errno));
@@ -1381,6 +1430,7 @@ void tcp_server::server(int thread_id)
 			}
 		}
 	}
+	log(NORMAL, "TCP server thread %s exiting\n", thread_name);
 }
 
 /**
@@ -1401,6 +1451,21 @@ void tcp_server::accept(int epoll_fd)
 		log(NORMAL, "FATAL: couldn't accept incoming TCP connection: "
 				"%s\n", strerror(errno));
 		exit(1);
+	}
+
+	/* Make sure the connection appears to be coming from someone
+	 * we trust (as of August 2023, at CloudLab, external sites
+	 * could open connections).
+	 */
+	if (client_addr.in4.sin_family == AF_INET) {
+		uint8_t *ipaddr = (uint8_t *) &client_addr.in4.sin_addr;
+		if ((ipaddr[0] != 10) || (ipaddr[1] != 0) || (ipaddr[2] != 1)) {
+			log(NORMAL, "ERROR: tcp_server::accept rejecting "
+					"rogue TCP connection from %s\n",
+					print_address(&client_addr));
+			::close(fd);
+			return;
+		}
 	}
 	log(NORMAL, "tcp_server on port %d accepted connection from %s, fd %d\n",
 			port, print_address(&client_addr), fd);
@@ -1651,7 +1716,7 @@ client::~client()
 
 /**
  * check_completion() - Make sure that all outstanding requests have
- * completed; if not, generate a log message.
+ * completed; if not, generate log messages.
  * @protocol:  String that identifies the current protocol for the log
  *             message, if any.
  */
@@ -1666,7 +1731,9 @@ void client::check_completion(const char *protocol)
 			continue;
 		if (!server_info.empty())
 			server_info.append(", ");
-		snprintf(buffer, sizeof(buffer), "s%lu: %d", i, diff);
+		snprintf(buffer, sizeof(buffer), "node%d.%d: %d",
+				server_conns[i].server,
+				server_conns[i].server_port, diff);
 		server_info.append(buffer);
 	}
 	if ((incomplete != 0) || !server_info.empty())
@@ -1824,7 +1891,7 @@ homa_client::homa_client(int id)
 	: client(id)
 	, fd(-1)
         , buf_region(nullptr)
-	, buf_size(2000*HOMA_BPAGE_SIZE)
+	, buf_size(buf_bpages*HOMA_BPAGE_SIZE)
         , exit_sender(false)
         , exit_receivers(false)
         , sender_exited(false)
@@ -2002,7 +2069,7 @@ void homa_client::sender()
 		if (header->length < sizeof32(*header))
 			header->length = sizeof32(*header);
 		rinfos[slot].request_length = header->length;
-		header->cid = server_ids[server];
+		header->cid = server_conns[server];
 		header->cid.client_port = id;
 		header->freeze = freeze[header->cid.server];
 		header->short_response = one_way;
@@ -2019,7 +2086,7 @@ void homa_client::sender()
 				&server_addrs[server], &rpc_id, 0);
 		} else
 			status = homa_send(fd, sender_buffer, header->length,
-                &server_addrs[server], &rpc_id, 0);
+		&server_addrs[server], &rpc_id, 0);
 		if (status < 0) {
 			log(NORMAL, "FATAL: error in homa_send: %s (request "
 					"length %d)\n", strerror(errno),
@@ -2078,7 +2145,7 @@ uint64_t homa_client::measure_rtt(int server, int length, char *buffer,
 		header->length = HOMA_MAX_MESSAGE_LENGTH;
 	if (header->length < sizeof32(*header))
 		header->length = sizeof32(*header);
-	header->cid = server_ids[server];
+	header->cid = server_conns[server];
 	header->cid.client_port = id;
 	start = rdtsc();
 	status = homa_send(fd, buffer, header->length,
@@ -2397,7 +2464,7 @@ void tcp_client::sender()
 		if ((header.length > HOMA_MAX_MESSAGE_LENGTH) && tcp_trunc)
 			header.length = HOMA_MAX_MESSAGE_LENGTH;
 		rinfos[slot].request_length = header.length;
-		header.cid = server_ids[server];
+		header.cid = server_conns[server];
 		header.cid.client_port = id;
 		header.msg_id = slot;
 		header.freeze = freeze[header.cid.server];
@@ -2610,7 +2677,8 @@ void client_stats(uint64_t now)
 			backups += tclient->backups;
 	}
 	std::sort(cdf_times, cdf_times + cdf_index);
-	if ((last_stats_time != 0) && (request_bytes != last_client_bytes_out)) {
+	if ((last_stats_time != 0) && ((request_bytes != last_client_bytes_out)
+				|| (outstanding_rpcs != 0))){
 		double elapsed = to_seconds(now - last_stats_time);
 		double rpcs = (double) (client_rpcs - last_client_rpcs);
 		double delta_out = (double) (request_bytes
@@ -2680,16 +2748,19 @@ void log_stats()
  */
 int client_cmd(std::vector<string> &words)
 {
+	int first_server = 1;
+	int server_nodes = 1;
+	std::string servers;
+
+	buf_bpages = 1000;
 	client_iovec = false;
 	client_max = 1;
 	client_ports = 1;
 	first_port = 4000;
-	first_server = 1;
 	inet_family = AF_INET;
 	net_gbps = 0.0;
 	port_receivers = 1;
 	protocol = "homa";
-	server_nodes = 1;
 	tcp_trunc = true;
 	one_way = false;
 	unloaded = 0;
@@ -2697,7 +2768,11 @@ int client_cmd(std::vector<string> &words)
 	for (unsigned i = 1; i < words.size(); i++) {
 		const char *option = words[i].c_str();
 
-		if (strcmp(option, "--client-max") == 0) {
+		if (strcmp(option, "--buf-bpages") == 0) {
+			if (!parse(words, i+1, &buf_bpages, option, "integer"))
+				return 0;
+			i++;
+		} else if (strcmp(option, "--client-max") == 0) {
 			if (!parse(words, i+1, (int *) &client_max,
 					option, "integer"))
 				return 0;
@@ -2752,6 +2827,13 @@ int client_cmd(std::vector<string> &words)
 			if (!parse(words, i+1, &server_ports, option, "integer"))
 				return 0;
 			i++;
+		} else if (strcmp(option, "--servers") == 0) {
+			if ((i + 1) >= words.size()) {
+				printf("No value provided for %s\n", option);
+				return 0;
+			}
+			servers = words[i+1];
+			i++;
 		} else if (strcmp(option, "--unloaded") == 0) {
 			if (!parse(words, i+1, &unloaded, option, "integer"))
 				return 0;
@@ -2770,6 +2852,32 @@ int client_cmd(std::vector<string> &words)
 			return 0;
 		}
 	}
+
+	/* Figure out which nodes to use for servers (--servers,
+	 * --server-ports, --first-server).
+	 */
+	server_ids.clear();
+	if (!servers.empty()) {
+		std::vector<string> ids;
+
+		split(servers.c_str(), ',', ids);
+		for (std::string &id_string: ids) {
+			char *end;
+			int id = strtoul(id_string.c_str(), &end, 10);
+			if (*end != 0) {
+				printf("Bad server id '%s' in --servers "
+						"option '%s'\n",
+						id_string.c_str(),
+						servers.c_str());
+				return 0;
+			}
+			server_ids.push_back(id);
+		}
+	} else {
+		for (int i = 0; i < server_nodes; i++)
+			server_ids.push_back(first_server + i);
+	}
+
 	init_server_addrs();
 	client_port_max = client_max/client_ports;
 	if (client_port_max < 1)
@@ -2841,8 +2949,8 @@ int dump_times_cmd(std::vector<string> &words)
 			time_buffer);
 	fprintf(f, "# --protocol %s, --workload %s, --gpbs %.1f --threads %d,\n",
 			protocol, workload, net_gbps, client_ports);
-	fprintf(f, "# --server-nodes %d --server-ports %d, --client-max %d\n",
-			server_nodes, server_ports, client_max);
+	fprintf(f, "# --server-nodes %lu --server-ports %d, --client-max %d\n",
+			server_ids.size(), server_ports, client_max);
 	fprintf(f, "# Length   RTT (usec)\n");
 	for (client *client: clients) {
 		__u32 start = client->total_responses % NUM_CLIENT_STATS;
@@ -2977,6 +3085,7 @@ int log_cmd(std::vector<string> &words)
  */
 int server_cmd(std::vector<string> &words)
 {
+	buf_bpages = 1000;
 	first_port = 4000;
 	inet_family = AF_INET;
         protocol = "homa";
@@ -2988,7 +3097,11 @@ int server_cmd(std::vector<string> &words)
 	for (unsigned i = 1; i < words.size(); i++) {
 		const char *option = words[i].c_str();
 
-		if (strcmp(option, "--first-port") == 0) {
+		if (strcmp(option, "--buf-bpages") == 0) {
+			if (!parse(words, i+1, &buf_bpages, option, "integer"))
+				return 0;
+			i++;
+		} else if (strcmp(option, "--first-port") == 0) {
 			if (!parse(words, i+1, &first_port, option, "integer"))
 				return 0;
 			i++;
@@ -3059,6 +3172,7 @@ int stop_cmd(std::vector<string> &words)
 			for (client *client: clients)
 				client->stop_sender();
 		} else if (strcmp(option, "servers") == 0) {
+			log(NORMAL, "stop command deleting servers\n");
 			for (homa_server *server: homa_servers)
 				delete server;
 			homa_servers.clear();
@@ -3197,9 +3311,11 @@ void error_handler(int signal, siginfo_t* info, void* ucontext)
 	void* caller_address = reinterpret_cast<void*>(
 			uc->uc_mcontext.gregs[REG_RIP]);
 
-	log(NORMAL, "Signal %d (%s) at address %p from %p\n",
+	log(NORMAL, "ERROR: Signal %d (%s) at address %p from %p\n",
 			signal, strsignal(signal), info->si_addr,
 			caller_address);
+	tt("ERROR: Signal %d; freezing timetrace", signal);
+	time_trace::freeze();
 
 	const int max_frames = 128;
 	void* return_addresses[max_frames];
@@ -3222,6 +3338,10 @@ void error_handler(int signal, siginfo_t* info, void* ucontext)
 	log(NORMAL, "Backtrace:\n");
 	for (int i = 1; i < frames; ++i)
 		log(NORMAL, "%s\n", symbols[i]);
+	log(NORMAL, "Writing time trace to error.tt\n");
+	if (time_trace::print_to_file("error.tt"))
+		log(NORMAL, "ERROR: couldn't write time trace %s\n",
+				strerror(errno));
 	fflush(log_file);
 	while(1) {}
 

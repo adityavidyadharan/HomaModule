@@ -264,13 +264,14 @@ TEST_F(homa_plumbing, homa_set_sock_opt__success)
 
 	args.start = (void *) (((__u64) (buffer + PAGE_SIZE - 1))
 			& ~(PAGE_SIZE - 1));
-	args.length = 5*HOMA_BPAGE_SIZE;
+	args.length = 64*HOMA_BPAGE_SIZE;
 	self->optval.user = &args;
+	homa_pool_destroy(&self->hsk.buffer_pool);
 	EXPECT_EQ(0, -homa_setsockopt(&self->hsk.sock, IPPROTO_HOMA,
 			SO_HOMA_SET_BUF, self->optval,
 			sizeof(struct homa_set_buf_args)));
 	EXPECT_EQ(args.start, self->hsk.buffer_pool.region);
-	EXPECT_EQ(5, self->hsk.buffer_pool.num_bpages);
+	EXPECT_EQ(64, self->hsk.buffer_pool.num_bpages);
 	EXPECT_EQ(1, homa_cores[cpu_number]->metrics.so_set_buf_calls);
 }
 
@@ -423,46 +424,46 @@ TEST_F(homa_plumbing, homa_recvmsg__wrong_args_length)
 {
 	self->recvmsg_hdr.msg_controllen -= 1;
 	EXPECT_EQ(EINVAL, -homa_recvmsg(&self->hsk.inet.sk, &self->recvmsg_hdr,
-			0, 0, 0, &self->recvmsg_hdr.msg_namelen));
+			0, 0, &self->recvmsg_hdr.msg_namelen));
 }
 TEST_F(homa_plumbing, homa_recvmsg__cant_read_args)
 {
 	mock_copy_data_errors = 1;
 	EXPECT_EQ(EFAULT, -homa_recvmsg(&self->hsk.inet.sk, &self->recvmsg_hdr,
-			0, 0, 0, &self->recvmsg_hdr.msg_namelen));
+			0, 0, &self->recvmsg_hdr.msg_namelen));
 }
 TEST_F(homa_plumbing, homa_recvmsg__clear_cookie)
 {
 	// Make sure that the completion_cookie will be zero if anything
 	// goes wrong with the receive.
-	self->recvmsg_args._pad[0] = 1;
 	self->recvmsg_args.completion_cookie = 12345;
+	self->recvmsg_args.num_bpages = 1000000;
 	EXPECT_EQ(EINVAL, -homa_recvmsg(&self->hsk.inet.sk, &self->recvmsg_hdr,
-			0, 0, 0, &self->recvmsg_hdr.msg_namelen));
+			0, 0, &self->recvmsg_hdr.msg_namelen));
 	EXPECT_EQ(0, self->recvmsg_args.completion_cookie);
 }
-TEST_F(homa_plumbing, homa_recvmsg__pad_not_zero)
+TEST_F(homa_plumbing, homa_recvmsg__nonzero_pad)
 {
+	EXPECT_EQ(EAGAIN, -homa_recvmsg(&self->hsk.inet.sk, &self->recvmsg_hdr,
+			0, 0, &self->recvmsg_hdr.msg_namelen));
 	self->recvmsg_args._pad[0] = 1;
 	EXPECT_EQ(EINVAL, -homa_recvmsg(&self->hsk.inet.sk, &self->recvmsg_hdr,
-			0, 0, 0, &self->recvmsg_hdr.msg_namelen));
+			0, 0, &self->recvmsg_hdr.msg_namelen));
 }
 TEST_F(homa_plumbing, homa_recvmsg__num_bpages_too_large)
 {
 	self->recvmsg_args.num_bpages = HOMA_MAX_BPAGES + 1;
 	EXPECT_EQ(EINVAL, -homa_recvmsg(&self->hsk.inet.sk, &self->recvmsg_hdr,
-			0, 0, 0, &self->recvmsg_hdr.msg_namelen));
+			0, 0, &self->recvmsg_hdr.msg_namelen));
 }
 TEST_F(homa_plumbing, homa_recvmsg__bogus_flags)
 {
 	self->recvmsg_args.flags = 1 << 10;
 	EXPECT_EQ(EINVAL, -homa_recvmsg(&self->hsk.inet.sk, &self->recvmsg_hdr,
-			0, 0, 0, &self->recvmsg_hdr.msg_namelen));
+			0, 0, &self->recvmsg_hdr.msg_namelen));
 }
 TEST_F(homa_plumbing, homa_recvmsg__release_buffers)
 {
-	EXPECT_EQ(0, -homa_pool_init(&self->hsk.buffer_pool, &self->homa,
-			(char *) 0x1000000, 100*HOMA_BPAGE_SIZE));
 	EXPECT_EQ(0, -homa_pool_get_pages(&self->hsk.buffer_pool, 2,
 			self->recvmsg_args.bpage_offsets, 0));
 	EXPECT_EQ(1, atomic_read(&self->hsk.buffer_pool.descriptors[0].refs));
@@ -472,21 +473,15 @@ TEST_F(homa_plumbing, homa_recvmsg__release_buffers)
 	self->recvmsg_args.bpage_offsets[1] = HOMA_BPAGE_SIZE;
 
 	EXPECT_EQ(EAGAIN, -homa_recvmsg(&self->hsk.inet.sk, &self->recvmsg_hdr,
-			0, 0, 0, &self->recvmsg_hdr.msg_namelen));
+			0, 0, &self->recvmsg_hdr.msg_namelen));
 	EXPECT_EQ(0, atomic_read(&self->hsk.buffer_pool.descriptors[0].refs));
 	EXPECT_EQ(0, atomic_read(&self->hsk.buffer_pool.descriptors[1].refs));
-}
-TEST_F(homa_plumbing, homa_recvmsg__nonblocking_argument)
-{
-	self->recvmsg_args.flags = HOMA_RECVMSG_REQUEST;
-	EXPECT_EQ(EAGAIN, -homa_recvmsg(&self->hsk.inet.sk, &self->recvmsg_hdr,
-			0, 1, 0, &self->recvmsg_hdr.msg_namelen));
 }
 TEST_F(homa_plumbing, homa_recvmsg__error_in_homa_wait_for_message)
 {
 	self->hsk.shutdown = true;
 	EXPECT_EQ(ESHUTDOWN, -homa_recvmsg(&self->hsk.inet.sk,
-			&self->recvmsg_hdr, 0, 0, 0,
+			&self->recvmsg_hdr, 0, 0,
 			&self->recvmsg_hdr.msg_namelen));
 	self->hsk.shutdown = false;
 }
@@ -498,8 +493,6 @@ TEST_F(homa_plumbing, homa_recvmsg__normal_completion_ipv4)
 	mock_sock_init(&self->hsk, &self->homa, 0);
 	__u32 pages[2];
 
-	EXPECT_EQ(0, -homa_pool_init(&self->hsk.buffer_pool, &self->homa,
-			(char *) 0x1000000, 100*HOMA_BPAGE_SIZE));
 	EXPECT_EQ(0, -homa_pool_get_pages(&self->hsk.buffer_pool, 2, pages, 0));
 	struct homa_rpc *crpc = unit_client_rpc(&self->hsk, UNIT_RCVD_MSG,
 			self->client_ip, self->server_ip, self->server_port,
@@ -509,12 +502,14 @@ TEST_F(homa_plumbing, homa_recvmsg__normal_completion_ipv4)
 	crpc->completion_cookie = 44444;
 
 	EXPECT_EQ(2000, homa_recvmsg(&self->hsk.inet.sk, &self->recvmsg_hdr,
-			0, 0, 0, &self->recvmsg_hdr.msg_namelen));
+			0, 0, &self->recvmsg_hdr.msg_namelen));
 	EXPECT_EQ(self->client_id, self->recvmsg_args.id);
 	EXPECT_EQ(44444, self->recvmsg_args.completion_cookie);
 	EXPECT_EQ(AF_INET, self->addr.in4.sin_family);
 	EXPECT_STREQ("1.2.3.4", homa_print_ipv4_addr(
 			self->addr.in4.sin_addr.s_addr));
+	EXPECT_STREQ("1.2.3.4", homa_print_ipv4_addr(
+			self->recvmsg_args.peer_addr.in4.sin_addr.s_addr));
 	EXPECT_EQ(sizeof32(struct sockaddr_in),
 			self->recvmsg_hdr.msg_namelen);
 	EXPECT_EQ(0, unit_list_length(&self->hsk.active_rpcs));
@@ -532,8 +527,6 @@ TEST_F(homa_plumbing, homa_recvmsg__normal_completion_ipv6)
 	mock_sock_init(&self->hsk, &self->homa, 0);
 	struct in6_addr server_ip6 = unit_get_in_addr("1::3:5:7");
 
-	EXPECT_EQ(0, -homa_pool_init(&self->hsk.buffer_pool, &self->homa,
-			(char *) 0x1000000, 100*HOMA_BPAGE_SIZE));
 	struct homa_rpc *crpc = unit_client_rpc(&self->hsk, UNIT_RCVD_MSG,
 			self->client_ip, &server_ip6, self->server_port,
 			self->client_id, 100, 2000);
@@ -542,7 +535,7 @@ TEST_F(homa_plumbing, homa_recvmsg__normal_completion_ipv6)
 	crpc->completion_cookie = 44444;
 
 	EXPECT_EQ(2000, homa_recvmsg(&self->hsk.inet.sk, &self->recvmsg_hdr,
-			0, 0, 0, &self->recvmsg_hdr.msg_namelen));
+			0, 0, &self->recvmsg_hdr.msg_namelen));
 	EXPECT_EQ(self->client_id, self->recvmsg_args.id);
 	EXPECT_EQ(44444, self->recvmsg_args.completion_cookie);
 	EXPECT_EQ(AF_INET6, self->addr.in6.sin6_family);
@@ -555,8 +548,6 @@ TEST_F(homa_plumbing, homa_recvmsg__normal_completion_ipv6)
 }
 TEST_F(homa_plumbing, homa_recvmsg__rpc_has_error)
 {
-	EXPECT_EQ(0, -homa_pool_init(&self->hsk.buffer_pool, &self->homa,
-			(char *) 0x1000000, 100*HOMA_BPAGE_SIZE));
 	struct homa_rpc *crpc = unit_client_rpc(&self->hsk, UNIT_OUTGOING,
 			self->client_ip, self->server_ip, self->server_port,
 			self->client_id, 100, 2000);
@@ -565,17 +556,18 @@ TEST_F(homa_plumbing, homa_recvmsg__rpc_has_error)
 	homa_rpc_abort(crpc, -ETIMEDOUT);
 
 	EXPECT_EQ(ETIMEDOUT, -homa_recvmsg(&self->hsk.inet.sk,
-			&self->recvmsg_hdr, 0, 0, 0,
+			&self->recvmsg_hdr, 0, 0,
 			&self->recvmsg_hdr.msg_namelen));
 	EXPECT_EQ(self->client_id, self->recvmsg_args.id);
 	EXPECT_EQ(44444, self->recvmsg_args.completion_cookie);
+	EXPECT_EQ(AF_INET6, self->recvmsg_args.peer_addr.in6.sin6_family);
+	EXPECT_STREQ("1.2.3.4", homa_print_ipv6_addr(
+			&self->recvmsg_args.peer_addr.in6.sin6_addr));
 	EXPECT_EQ(0, unit_list_length(&self->hsk.active_rpcs));
 	EXPECT_EQ(0, self->recvmsg_args.num_bpages);
 }
 TEST_F(homa_plumbing, homa_recvmsg__add_ack)
 {
-	EXPECT_EQ(0, -homa_pool_init(&self->hsk.buffer_pool, &self->homa,
-			(char *) 0x1000000, 100*HOMA_BPAGE_SIZE));
 	struct homa_rpc *crpc = unit_client_rpc(&self->hsk, UNIT_RCVD_MSG,
 			self->client_ip, self->server_ip, self->server_port,
 			self->client_id, 100, 2000);
@@ -584,20 +576,18 @@ TEST_F(homa_plumbing, homa_recvmsg__add_ack)
 	crpc->completion_cookie = 44444;
 
 	EXPECT_EQ(2000, homa_recvmsg(&self->hsk.inet.sk, &self->recvmsg_hdr,
-			0, 0, 0, &self->recvmsg_hdr.msg_namelen));
+			0, 0, &self->recvmsg_hdr.msg_namelen));
 	EXPECT_EQ(1, crpc->peer->num_acks);
 }
 TEST_F(homa_plumbing, homa_recvmsg__server_normal_completion)
 {
-	EXPECT_EQ(0, -homa_pool_init(&self->hsk.buffer_pool, &self->homa,
-			(char *) 0x1000000, 100*HOMA_BPAGE_SIZE));
 	struct homa_rpc *srpc = unit_server_rpc(&self->hsk, UNIT_RCVD_MSG,
 			self->client_ip, self->server_ip, self->client_port,
 		        self->server_id, 100, 200);
 	EXPECT_NE(NULL, srpc);
 
 	EXPECT_EQ(100, homa_recvmsg(&self->hsk.inet.sk, &self->recvmsg_hdr,
-			0, 0, 0, &self->recvmsg_hdr.msg_namelen));
+			0, 0, &self->recvmsg_hdr.msg_namelen));
 	EXPECT_EQ(self->server_id, self->recvmsg_args.id);
 	EXPECT_EQ(RPC_IN_SERVICE, srpc->state);
 	EXPECT_EQ(0, srpc->peer->num_acks);
@@ -605,8 +595,6 @@ TEST_F(homa_plumbing, homa_recvmsg__server_normal_completion)
 }
 TEST_F(homa_plumbing, homa_recvmsg__delete_server_rpc_after_error)
 {
-	EXPECT_EQ(0, -homa_pool_init(&self->hsk.buffer_pool, &self->homa,
-			(char *) 0x1000000, 100*HOMA_BPAGE_SIZE));
 	struct homa_rpc *srpc = unit_server_rpc(&self->hsk, UNIT_RCVD_MSG,
 			self->client_ip, self->server_ip, self->client_port,
 		        self->server_id, 100, 200);
@@ -614,15 +602,13 @@ TEST_F(homa_plumbing, homa_recvmsg__delete_server_rpc_after_error)
 	srpc->error = -ENOMEM;
 
 	EXPECT_EQ(ENOMEM, -homa_recvmsg(&self->hsk.inet.sk, &self->recvmsg_hdr,
-			0, 0, 0, &self->recvmsg_hdr.msg_namelen));
+			0, 0, &self->recvmsg_hdr.msg_namelen));
 	EXPECT_EQ(self->server_id, self->recvmsg_args.id);
 	EXPECT_EQ(RPC_DEAD, srpc->state);
 	EXPECT_EQ(0, unit_list_length(&self->hsk.active_rpcs));
 }
 TEST_F(homa_plumbing, homa_recvmsg__error_copying_out_args)
 {
-	EXPECT_EQ(0, -homa_pool_init(&self->hsk.buffer_pool, &self->homa,
-			(char *) 0x1000000, 100*HOMA_BPAGE_SIZE));
 	struct homa_rpc *crpc = unit_client_rpc(&self->hsk, UNIT_RCVD_MSG,
 			self->client_ip, self->server_ip, self->server_port,
 			self->client_id, 100, 2000);
@@ -631,14 +617,12 @@ TEST_F(homa_plumbing, homa_recvmsg__error_copying_out_args)
 	mock_copy_to_user_errors = 1;
 
 	EXPECT_EQ(EFAULT, -homa_recvmsg(&self->hsk.inet.sk, &self->recvmsg_hdr,
-			0, 0, 0, &self->recvmsg_hdr.msg_namelen));
+			0, 0, &self->recvmsg_hdr.msg_namelen));
 	EXPECT_EQ(0, self->recvmsg_args.id);
 	EXPECT_EQ(0, unit_list_length(&self->hsk.active_rpcs));
 }
 TEST_F(homa_plumbing, homa_recvmsg__copy_back_args_even_after_error)
 {
-	EXPECT_EQ(0, -homa_pool_init(&self->hsk.buffer_pool, &self->homa,
-			(char *) 0x1000000, 100*HOMA_BPAGE_SIZE));
 	EXPECT_EQ(0, -homa_pool_get_pages(&self->hsk.buffer_pool, 2,
 			self->recvmsg_args.bpage_offsets, 0));
 	EXPECT_EQ(1, atomic_read(&self->hsk.buffer_pool.descriptors[0].refs));
@@ -648,7 +632,7 @@ TEST_F(homa_plumbing, homa_recvmsg__copy_back_args_even_after_error)
 	self->recvmsg_args.bpage_offsets[1] = HOMA_BPAGE_SIZE;
 
 	EXPECT_EQ(EAGAIN, -homa_recvmsg(&self->hsk.inet.sk, &self->recvmsg_hdr,
-			0, 0, 0, &self->recvmsg_hdr.msg_namelen));
+			0, 0, &self->recvmsg_hdr.msg_namelen));
 	EXPECT_EQ(0, self->recvmsg_args.num_bpages);
 }
 

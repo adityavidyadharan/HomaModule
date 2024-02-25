@@ -1,4 +1,4 @@
-/* Copyright (c) 2019-2022 Stanford University
+/* Copyright (c) 2019-2023 Stanford University
  *
  * Permission to use, copy, modify, and/or distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -18,6 +18,8 @@
  */
 
 #include "homa_impl.h"
+
+#define CORES_TO_CHECK 4
 
 static const struct net_offload homa_offload = {
 	.callbacks = {
@@ -149,12 +151,16 @@ struct sk_buff *homa_gro_receive(struct list_head *held_list,
 	struct sk_buff *held_skb;
 	struct sk_buff *result = NULL;
 	struct homa_core *core = homa_cores[raw_smp_processor_id()];
+	__u64 now = get_cycles();
+	int busy = (now - core->last_gro) < homa->gro_busy_cycles;
 	__u32 hash;
 	__u64 saved_softirq_metric, softirq_cycles;
 	struct data_header *h_new = (struct data_header *)
 			skb_transport_header(skb);
 	int priority;
 	__u32 saddr;
+
+	core->last_active = now;
 	if (skb_is_ipv6(skb)) {
 		priority = ipv6_hdr(skb)->priority;
 		saddr = ntohl(ipv6_hdr(skb)->saddr.in6_u.u6_addr32[3]);
@@ -167,12 +173,18 @@ struct sk_buff *homa_gro_receive(struct list_head *held_list,
 //	if (!pskb_may_pull(skb, 64))
 //		tt_record("homa_gro_receive can't pull enough data "
 //				"from packet for trace");
-	if (h_new->common.type == DATA)
+	if (h_new->common.type == DATA) {
 		tt_record4("homa_gro_receive got packet from 0x%x "
 				"id %llu, offset %d, priority %d",
 				saddr, homa_local_id(h_new->common.sender_id),
 				ntohl(h_new->seg.offset), priority);
-	else if (h_new->common.type == GRANT) {
+		if ((h_new->seg.segment_length == h_new->message_length)
+				&& (homa->gro_policy & HOMA_GRO_SHORT_BYPASS)
+				&& !busy) {
+			INC_METRIC(gro_data_bypasses, 1);
+			goto bypass;
+		}
+	} else if (h_new->common.type == GRANT) {
 		tt_record4("homa_gro_receive got grant from 0x%x "
 				"id %llu, offset %d, priority %d",
 				saddr, homa_local_id(h_new->common.sender_id),
@@ -184,20 +196,15 @@ struct sk_buff *homa_gro_receive(struct list_head *held_list,
 		 * a significant difference in throughput for large
 		 * messages, especially when the system is loaded.
 		 */
-		if (homa->gro_policy & HOMA_GRO_FAST_GRANTS)
+		if ((homa->gro_policy & HOMA_GRO_FAST_GRANTS) && !busy) {
+			INC_METRIC(gro_grant_bypasses, 1);
 			goto bypass;
+		}
 	} else
 		tt_record4("homa_gro_receive got packet from 0x%x "
 				"id %llu, type 0x%x, priority %d",
 				saddr, homa_local_id(h_new->common.sender_id),
 				h_new->common.type, priority);
-
-	core->last_active = get_cycles();
-
-	if ((homa->gro_policy & HOMA_GRO_BYPASS)
-			|| ((homa->gro_policy & HOMA_GRO_SHORT_BYPASS)
-			&& (skb->len < 1400)))
-		goto bypass;
 
 	/* The GRO mechanism tries to separate packets onto different
 	 * gro_lists by hash. This is bad for us, because we want to batch
@@ -271,26 +278,125 @@ struct sk_buff *homa_gro_receive(struct list_head *held_list,
 
     done:
 	homa_check_pacer(homa, 1);
+	core->last_gro = get_cycles();
 	return result;
 
     bypass:
-	saved_softirq_metric = homa_cores[raw_smp_processor_id()]
-			->metrics.softirq_cycles;
-	homa_softirq(skb);
-	softirq_cycles = homa_cores[raw_smp_processor_id()]
-			->metrics.softirq_cycles - saved_softirq_metric;
-	homa_cores[raw_smp_processor_id()]->metrics.softirq_cycles
-			= saved_softirq_metric;
-	INC_METRIC(bypass_softirq_cycles, softirq_cycles);
-
         /* Record SoftIRQ cycles in a different metric to reflect that
 	 * they happened during bypass.
 	 */
-
+	saved_softirq_metric = core->metrics.softirq_cycles;
+	homa_softirq(skb);
+	softirq_cycles = core->metrics.softirq_cycles - saved_softirq_metric;
+	core->metrics.softirq_cycles = saved_softirq_metric;
+	INC_METRIC(bypass_softirq_cycles, softirq_cycles);
+	core->last_gro = get_cycles();
 
 	/* This return value indicates that we have freed skb. */
 	return ERR_PTR(-EINPROGRESS);
+}
 
+/**
+ * homa_gro_gen2() - When the Gen2 load balancer is being used this function
+ * is invoked by homa_gro_complete to choose a core to handle SoftIRQ for a
+ * batch of packets
+ * @skb:     First in a group of packets that are ready to be passed to SoftIRQ.
+ *           Information will be updated in the packet so that Linux will
+ *           direct it to the chosen core.
+ */
+void homa_gro_gen2(struct sk_buff *skb)
+{
+	/* Scan the next several cores in order after the current core,
+	 * trying to find one that is not already busy with SoftIRQ processing,
+	 * and that doesn't appear to be active with NAPI/GRO processing
+	 * either. If there is no such core, just rotate among the next
+	 * cores. See balance.txt for overall design information on load
+	 * balancing.
+	 */
+	struct data_header *h = (struct data_header *) skb_transport_header(skb);
+	int i;
+	int this_core = raw_smp_processor_id();
+	int candidate = this_core;
+	__u64 now = get_cycles();
+	struct homa_core *core;
+	for (i = CORES_TO_CHECK; i > 0; i--) {
+		candidate++;
+		if (unlikely(candidate >= nr_cpu_ids))
+			candidate = 0;
+		core = homa_cores[candidate];
+		if (atomic_read(&core->softirq_backlog)  > 0)
+			continue;
+		if ((core->last_gro + homa->busy_cycles) > now)
+			continue;
+		tt_record3("homa_gro_gen2 chose core %d for id %d "
+				"offset %d",
+				candidate, homa_local_id(h->common.sender_id),
+				ntohl(h->seg.offset));
+		break;
+	}
+	if (i <= 0) {
+		/* All of the candidates appear to be busy; just
+		 * rotate among them.
+		 */
+		int offset = homa_cores[this_core]->softirq_offset;
+		offset += 1;
+		if (offset > CORES_TO_CHECK)
+			offset = 1;
+		homa_cores[this_core]->softirq_offset = offset;
+		candidate = this_core + offset;
+		while (candidate >= nr_cpu_ids) {
+			candidate -= nr_cpu_ids;
+		}
+		tt_record3("homa_gro_gen2 chose core %d for id %d "
+				"offset %d (all cores busy)",
+				candidate, homa_local_id(h->common.sender_id),
+				ntohl(h->seg.offset));
+	}
+	atomic_inc(&homa_cores[candidate]->softirq_backlog);
+	homa_set_softirq_cpu(skb, candidate);
+}
+
+/**
+ * homa_gro_gen3() - When the Gen3 load balancer is being used this function
+ * is invoked by homa_gro_complete to choose a core to handle SoftIRQ for a
+ * batch of packets
+ * @skb:     First in a group of packets that are ready to be passed to SoftIRQ.
+ *           Information will be updated in the packet so that Linux will
+ *           direct it to the chosen core.
+ */
+void homa_gro_gen3(struct sk_buff *skb)
+{
+	/* See balance.txt for overall design information on the Gen3
+	 * load balancer.
+	 */
+	struct data_header *h = (struct data_header *) skb_transport_header(skb);
+	int i, core;
+	__u64 now, busy_time;
+	int *candidates = homa_cores[raw_smp_processor_id()]->gen3_softirq_cores;
+
+	now = get_cycles();
+	busy_time = now - homa->busy_cycles;
+
+	core = candidates[0];
+	for (i = 0; i <  NUM_GEN3_SOFTIRQ_CORES; i++) {
+		int candidate = candidates[i];
+		if (candidate < 0) {
+			break;
+		}
+		if (homa_cores[candidate]->last_app_active < busy_time) {
+			core = candidate;
+			break;
+		}
+	}
+	homa_set_softirq_cpu(skb, core);
+	homa_cores[core]->last_active = now;
+	tt_record4("homa_gro_gen3 chose core %d for id %d, offset %d, delta %d",
+			core, homa_local_id(h->common.sender_id),
+			ntohl(h->seg.offset),
+			now - homa_cores[core]->last_app_active);
+	INC_METRIC(gen3_handoffs, 1);
+	if (core != candidates[0])
+		INC_METRIC(gen3_alt_handoffs, 1);
 }
 
 /**
@@ -305,64 +411,15 @@ struct sk_buff *homa_gro_receive(struct list_head *held_list,
  */
 int homa_gro_complete(struct sk_buff *skb, int hoffset)
 {
-	struct common_header *h = (struct common_header *)
-			skb_transport_header(skb);
-	struct data_header *d = (struct data_header *) h;
+	struct data_header *h = (struct data_header *) skb_transport_header(skb);
 //	tt_record4("homa_gro_complete type %d, id %d, offset %d, count %d",
 //			h->type, homa_local_id(h->sender_id), ntohl(d->seg.offset),
 //			NAPI_GRO_CB(skb)->count);
 
-#define CORES_TO_CHECK 4
-	if (homa->gro_policy & HOMA_GRO_IDLE_NEW) {
-		/* Pick a specific core to handle SoftIRQ processing for this
-		 * group of packets. This policy scans the next several cores
-		 * in order after this, trying to find one that is not
-		 * already busy with SoftIRQ processing, and that doesn't appear
-		 * to be active with NAPI/GRO processing either. If there
-		 * is no such core, just rotate among the next cores.
-		 */
-		int i;
-		int this_core = raw_smp_processor_id();
-		int candidate = this_core;
-		__u64 now = get_cycles();
-		struct homa_core *core;
-		for (i = CORES_TO_CHECK; i > 0; i--) {
-			candidate++;
-			if (unlikely(candidate >= nr_cpu_ids))
-				candidate = 0;
-			core = homa_cores[candidate];
-			if (atomic_read(&core->softirq_backlog)  > 0)
-				continue;
-			if ((core->last_gro + homa->gro_busy_cycles) > now)
-				continue;
-			tt_record3("homa_gro_complete chose core %d for id %d "
-					"offset %d with IDLE_NEW policy",
-					candidate, homa_local_id(h->sender_id),
-					ntohl(d->seg.offset));
-			break;
-		}
-		if (i <= 0) {
-			/* All of the candidates appear to be busy; just
-			 * rotate among them.
-			 */
-			int offset = homa_cores[this_core]->softirq_offset;
-			offset += 1;
-			if (offset > CORES_TO_CHECK)
-				offset = 1;
-			homa_cores[this_core]->softirq_offset = offset;
-			candidate = this_core + offset;
-			while (candidate >= nr_cpu_ids) {
-				candidate -= nr_cpu_ids;
-			}
-			tt_record3("homa_gro_complete chose core %d for id %d "
-					"offset %d with IDLE_NEW policy "
-					"(all cores busy)",
-					candidate, homa_local_id(h->sender_id),
-					ntohl(d->seg.offset));
-		}
-		atomic_inc(&homa_cores[candidate]->softirq_backlog);
-		homa_cores[this_core]->last_gro = now;
-		homa_set_softirq_cpu(skb, candidate);
+	if (homa->gro_policy & HOMA_GRO_GEN3) {
+		homa_gro_gen3(skb);
+	} else if (homa->gro_policy & HOMA_GRO_GEN2) {
+		homa_gro_gen2(skb);
 	} else if (homa->gro_policy & HOMA_GRO_IDLE) {
 		int i, core, best;
 		__u64 best_time = ~0;
@@ -389,8 +446,8 @@ int homa_gro_complete(struct sk_buff *skb, int hoffset)
 		homa_set_softirq_cpu(skb, best);
 		tt_record3("homa_gro_complete chose core %d for id %d "
 				"offset %d with IDLE policy",
-				best, homa_local_id(h->sender_id),
-				ntohl(d->seg.offset));
+				best, homa_local_id(h->common.sender_id),
+				ntohl(h->seg.offset));
 	} else if (homa->gro_policy & HOMA_GRO_NEXT) {
 		/* Use the next core (in circular order) to handle the
 		 * SoftIRQ processing.
@@ -401,8 +458,8 @@ int homa_gro_complete(struct sk_buff *skb, int hoffset)
 		homa_set_softirq_cpu(skb, target);
 		tt_record3("homa_gro_complete chose core %d for id %d "
 				"offset %d with NEXT policy",
-				target, homa_local_id(h->sender_id),
-				ntohl(d->seg.offset));
+				target, homa_local_id(h->common.sender_id),
+				ntohl(h->seg.offset));
 	}
 
 	return 0;

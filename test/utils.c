@@ -219,26 +219,22 @@ void unit_log_frag_list(struct sk_buff *skb, int verbose)
  */
 void unit_log_grantables(struct homa *homa)
 {
-	struct homa_peer *peer;
 	struct homa_rpc *rpc;
 	int count = 0;
-	list_for_each_entry(peer, &homa->grantable_peers, grantable_links) {
+	list_for_each_entry(rpc, &homa->grantable_rpcs, grantable_links) {
 		count++;
-		list_for_each_entry(rpc, &peer->grantable_rpcs,
-				grantable_links) {
-			unit_log_printf("; ", "%s from %s, id %lu, "
-					"remaining %d",
-					homa_is_client(rpc->id) ? "response"
-					: "request",
-					homa_print_ipv6_addr(&peer->addr),
-					(long unsigned int) rpc->id,
-					rpc->msgin.bytes_remaining);
-		}
+		unit_log_printf("; ", "%s from %s, id %lu, "
+				"remaining %d",
+				homa_is_client(rpc->id) ? "response"
+				: "request",
+				homa_print_ipv6_addr(&rpc->peer->addr),
+				(long unsigned int) rpc->id,
+				rpc->msgin.bytes_remaining);
 	}
-	if (count != homa->num_grantable_peers) {
-		unit_log_printf("; ", "num_grantable_peers error: should "
+	if (count != homa->num_grantable_rpcs) {
+		unit_log_printf("; ", "num_grantable_rpcs error: should "
 				"be %d, is %d",
-				count, homa->num_grantable_peers);
+				count, homa->num_grantable_rpcs);
 	}
 }
 
@@ -333,6 +329,27 @@ void unit_log_throttled(struct homa *homa)
 }
 
 /**
+ * unit_print_gaps() - Returns a static string describing the gaps in an RPC.
+ * @rpc:     Log the gaps in this RPC.
+ */
+const char *unit_print_gaps(struct homa_rpc *rpc)
+{
+	struct homa_gap *gap;
+	static char buffer[1000];
+	int used = 0;
+
+	buffer[0] = 0;
+	list_for_each_entry(gap, &rpc->msgin.gaps, links) {
+		if (used != 0)
+			used += snprintf(buffer + used, sizeof(buffer) - used,
+					"; ");
+		used += snprintf(buffer + used, sizeof(buffer) - used,
+				"start %d, end %d", gap->start, gap->end);
+	}
+	return buffer;
+}
+
+/**
  * unit_server_rpc() - Create a homa_server_rpc and arrange for it to be
  * in a given state.
  * @hsk:           Socket that will receive the incoming RPC.
@@ -352,7 +369,7 @@ struct homa_rpc *unit_server_rpc(struct homa_sock *hsk,
 		struct in6_addr *server_ip, int client_port, int id,
 		int req_length, int resp_length)
 {
-	int bytes_received;
+	int bytes_received, created;
 	int incoming_delta = 0;
 	struct data_header h = {
 		.common = {
@@ -371,7 +388,8 @@ struct homa_rpc *unit_server_rpc(struct homa_sock *hsk,
 	};
 	if (req_length < UNIT_TEST_DATA_PER_PACKET)
 		h.seg.segment_length = htonl(req_length);
-	struct homa_rpc *srpc = homa_rpc_new_server(hsk, client_ip, &h);
+	struct homa_rpc *srpc = homa_rpc_new_server(hsk, client_ip, &h,
+			&created);
 	if (IS_ERR(srpc))
 		return NULL;
 	EXPECT_EQ(srpc->completion_cookie, 0);

@@ -1,6 +1,6 @@
 #!/usr/bin/python3
 
-# Copyright (c) 2020-2022 Stanford University
+# Copyright (c) 2020-2023 Stanford University
 #
 # Permission to use, copy, modify, and/or distribute this software for any
 # purpose with or without fee is hereby granted, provided that the above
@@ -61,8 +61,19 @@ log_dir = ''
 # Open file (in the log directory) where log messages should be written.
 log_file = 0
 
+# True means use new slowdown calculation, where denominator is calculated
+# using best-case Homa unloaded RTT plus link bandwidth; False means use
+# original calculation where the denominator is Homa P50 unloaded latency.
+old_slowdown = False
+
 # Indicates whether we should generate additional log messages for debugging
 verbose = False
+
+# The --delete-rtts command-line option.
+delete_rtts = False
+
+# The CloudLab node type for this node (e.g. xl170)
+node_type = None
 
 # Defaults for command-line options; assumes that servers and clients
 # share nodes.
@@ -78,7 +89,7 @@ default_defaults = {
     'protocol':            'homa',
     'port_receivers':      3,
     'port_threads':        3,
-    'seconds':             5,
+    'seconds':             30,
     'server_ports':        3,
     'tcp_client_ports':    4,
     'tcp_port_receivers':  1,
@@ -106,11 +117,15 @@ default_defaults = {
 # slow_50:         List of 50th percentile slowdowns corresponding to each length
 # slow_99:         List of 99th percentile slowdowns corresponding to each length
 # slow_999:        List of 999th percentile slowdowns corresponding to each length
+# avg_slowdown:    Average slowdown across all messages of all sizes
 digests = {}
 
 # A dictionary where keys are message lengths, and each value is the median
 # unloaded RTT (usecs) for messages of that length.
 unloaded_p50 = {}
+
+# Minimum RTT for any measurement in the unloaded dataset
+min_rtt = 1e20;
 
 # Keys are filenames, and each value is a dictionary containing data read
 # from that file. Within that dictionary, each key is the name of a column
@@ -160,6 +175,7 @@ def log(message):
     """
     global log_file
     print(message)
+    log_file.write("%.9f " % (time.time()))
     log_file.write(message)
     log_file.write("\n")
 
@@ -173,6 +189,7 @@ def vlog(message):
     global log_file, verbose
     if verbose:
         print(message)
+    log_file.write("%.9f " % (time.time()))
     log_file.write(message)
     log_file.write("\n")
 
@@ -214,6 +231,8 @@ def get_parser(description, usage, defaults = {}):
             help='Name to use for the cperf log file (default: cperf.log)')
     parser.add_argument('-d', '--debug', dest='debug', action='store_true',
             help='Pause after starting servers to enable debugging setup')
+    parser.add_argument('--delete-rtts', dest='delete_rtts', action='store_true',
+            help='Delete .rtt files after reading, in order to save disk space')
     parser.add_argument('-h', '--help', action='help',
             help='Show this help message and exit')
     parser.add_argument('-6', '--ipv6', dest='ipv6', action='store_const',
@@ -232,6 +251,11 @@ def get_parser(description, usage, defaults = {}):
     parser.add_argument('--no-homa-prio', dest='no_homa_prio',
             action='store_true', default=False,
             help='Don\'t run homa_prio on nodes to adjust unscheduled cutoffs')
+    parser.add_argument('--old-slowdown', dest='old_slowdown',
+            action='store_true', default=False,
+            help='Compute slowdowns using the approach of the Homa ATC '
+            'paper (default: use 15 usec RTT and 100%% link throughput as '
+            'reference)')
     parser.add_argument('--plot-only', dest='plot_only', action='store_true',
             help='Don\'t run experiments; generate plot(s) with existing data')
     parser.add_argument('--port-receivers', type=int, dest='port_receivers',
@@ -254,6 +278,14 @@ def get_parser(description, usage, defaults = {}):
             metavar='count', default=defaults['server_ports'],
             help='Number of ports on which each server should listen '
             '(default: %d)'% (defaults['server_ports']))
+    parser.add_argument('--set-ids', dest='set_ids', type=boolean,
+            default=True, metavar="T/F", help="Boolean value: if true, the "
+            "next_id sysctl parameter will be set on each node in order to "
+            "avoid conflicting RPC ids on different nodes (default: true)")
+    parser.add_argument('--skip', dest='skip',
+            metavar='nodes',
+            help='List of node numbers not to use in the experiment; can '
+            ' contain ranges, such as "3,5-8,12"')
     parser.add_argument('--tcp-client-ports', type=int, dest='tcp_client_ports',
             metavar='count', default=defaults['tcp_client_ports'],
             help='Number of ports on which each TCP client should issue requests '
@@ -294,8 +326,9 @@ def init(options):
     """
     Initialize various global state, such as the log file.
     """
-    global log_dir, log_file, verbose
+    global old_slowdown, log_dir, log_file, verbose, delete_rtts
     log_dir = options.log_dir
+    old_slowdown = options.old_slowdown
     if not options.plot_only:
         if os.path.exists(log_dir):
             shutil.rmtree(log_dir)
@@ -306,6 +339,29 @@ def init(options):
     vlog("cperf starting at %s" % (date_time))
     s = ""
 
+    # Figure out which nodes to use for the experiment
+    skips = {}
+    if options.skip:
+        for spec in options.skip.split(","):
+            nodes = spec.split("-")
+            if len(nodes) == 1:
+                skips[int(spec)] = 1
+            elif len(nodes) == 2:
+                for i in range(int(nodes[0]), int(nodes[1])+1):
+                    skips[i] = 1
+            else:
+                raise Exception("Bad skip range '%s': must be either id "
+                       "or id1-id2" % (spec))
+    nodes = []
+    id = 0
+    while len(nodes) != options.num_nodes:
+        if not id in skips:
+            nodes.append(id)
+        id += 1
+    options.nodes = nodes
+    options.servers = options.nodes
+    options.clients = options.nodes
+
     # Log configuration information, including options here as well
     # as Homa's configuration parameters.
     opts = vars(options)
@@ -315,19 +371,22 @@ def init(options):
         s += ("--%s: %s" % (name, str(opts[name])))
     vlog("Options: %s" % (s))
     vlog("Homa configuration:")
-    for param in ['dead_buffs_limit', 'duty_cycle', 'grant_fifo_fraction',
-            'grant_increment', 'gro_policy', 'link_mbps', 'max_dead_buffs',
-            'max_gro_skbs', 'max_gso_size', 'max_nic_queue_ns',
-            'max_overcommit', 'num_priorities', 'pacer_fifo_fraction',
+    for param in ['dead_buffs_limit', 'grant_fifo_fraction',
+            'gro_policy', 'link_mbps', 'max_dead_buffs',
+            'max_grantable_rpcs', 'max_gro_skbs', 'max_gso_size',
+            'max_nic_queue_ns', 'max_incoming', 'max_overcommit',
+            'max_rpcs_per_peer', 'num_priorities', 'pacer_fifo_fraction',
             'poll_usecs', 'reap_limit', 'resend_interval', 'resend_ticks',
-            'rtt_bytes', 'throttle_min_bytes', 'timeout_resends']:
-        result = subprocess.run(['sysctl', '-n', '.net.homa.' + param],
-                capture_output = True, encoding="utf-8")
-        vlog("  %-20s %s" % (param, result.stdout.rstrip()))
+            'throttle_min_bytes', 'timeout_resends', 'unsched_bytes', 'window']:
+        result = do_subprocess(['sysctl', '-n', '.net.homa.' + param])
+        vlog("  %-20s %s" % (param, result))
 
     if options.mtu != 0:
         log("Setting MTU to %d" % (options.mtu))
-        do_ssh(["config", "mtu", str(options.mtu)], range(0, options.num_nodes))
+        do_ssh(["config", "mtu", str(options.mtu)], options.nodes)
+
+    if options.delete_rtts:
+        delete_rtts = True
 
 def wait_output(string, nodes, cmd, time_limit=10.0):
     """
@@ -335,6 +394,7 @@ def wait_output(string, nodes, cmd, time_limit=10.0):
     each of the nodes in the list given by nodes. If a long time goes by without
     the string appearing, an exception is thrown.
     string:      The value to wait for
+    nodes:       List of node ids from which output is expected
     cmd:         Used in error messages to indicate the command that failed
     time_limit:  An error will be generated if this much time goes by without
                  the desired string appearing
@@ -342,6 +402,7 @@ def wait_output(string, nodes, cmd, time_limit=10.0):
     global active_nodes
     outputs = []
     printed = False
+    bad_node = -1
 
     for id in nodes:
         while len(outputs) <= id:
@@ -349,7 +410,8 @@ def wait_output(string, nodes, cmd, time_limit=10.0):
     start_time = time.time()
     while True:
         if time.time() > (start_time + time_limit):
-          raise Exception("timeout exceeded for command '%s'" % (cmd))
+            raise Exception("timeout (%.1fs) exceeded for command '%s' on node%d"
+                    % (time_limit, cmd, bad_node))
         for id in nodes:
             data = active_nodes[id].stdout.read(1000)
             if data != None:
@@ -376,17 +438,17 @@ def wait_output(string, nodes, cmd, time_limit=10.0):
             "expected '%s', got '%s'"
             % (bad_node, cmd, string, outputs[bad_node]))
 
-def start_nodes(r, options):
+def start_nodes(ids, options):
     """
     Start up cp_node on a group of nodes.
 
-    r:        The range of nodes on which to start cp_node, if it isn't already
+    ids:      List of node ids on which to start cp_node, if it isn't already
               running
     options:  Command-line options that may affect experiment
     """
     global active_nodes
     started = []
-    for id in r:
+    for id in ids:
         if id in active_nodes:
             continue
         vlog("Starting cp_node on node%d" % (id))
@@ -408,6 +470,9 @@ def start_nodes(r, options):
                     str(options.unsched_boost)], encoding="utf-8",
                     stdout=f, stderr=subprocess.STDOUT)
             f.close
+        if options.set_ids:
+            set_sysctl_parameter(".net.homa.next_id", str(100000000*(id+1)),
+                    [id])
         started.append(id)
     wait_output("% ", started, "ssh")
     log_level = "normal"
@@ -425,13 +490,13 @@ def stop_nodes():
     """
     global active_nodes, server_nodes
     for id, popen in homa_prios.items():
-        subprocess.run(["ssh", "-o", "StrictHostKeyChecking=no",
+        do_subprocess(["ssh", "-o", "StrictHostKeyChecking=no",
                 "node%d" % id, "sudo", "pkill", "homa_prio"])
         try:
             popen.wait(5.0)
         except subprocess.TimeoutExpired:
             log("Timeout killing homa_prio on node%d" % (id))
-    for node in active_nodes.values():
+    for id, node in active_nodes.items():
         node.stdin.write("exit\n")
         try:
             node.stdin.flush()
@@ -440,27 +505,27 @@ def stop_nodes():
     for node in active_nodes.values():
         node.wait(5.0)
     for id in active_nodes:
-        subprocess.run(["rsync", "-rtvq", "node%d:node.log" % (id),
+        do_subprocess(["rsync", "-rtvq", "node%d:node.log" % (id),
                 "%s/node%d.log" % (log_dir, id)])
     active_nodes.clear()
     server_nodes = range(0,0)
 
-def do_cmd(command, r, r2 = range(0,0)):
+def do_cmd(command, ids, ids2 = []):
     """
     Execute a cp_node command on a given group of nodes.
 
     command:    A command to execute on each node
-    r:          A group of node ids on which to run the command (range, list, etc.)
-    r2:         An optional additional group of node ids on which to run the
-                command; if a note is present in both r and r2, the
+    ids:        List of node ids on which to run the command
+    ids2:       An optional additional list of node ids on which to run the
+                command; if a node is present in both r and r2, the
                 command will only be performed once
     """
     global active_nodes
     nodes = []
-    for id in r:
+    for id in ids:
         nodes.append(id)
-    for id in r2:
-        if id not in r:
+    for id in ids2:
+        if id not in ids:
             nodes.append(id)
     for id in nodes:
         vlog("Command for node%d: %s" % (id, command))
@@ -481,8 +546,7 @@ def do_ssh(command, nodes):
     """
     vlog("ssh command on nodes %s: %s" % (str(nodes), " ".join(command)))
     for id in nodes:
-        subprocess.run(["ssh", "node%d" % id] + command,
-                stdout=subprocess.DEVNULL)
+        do_subprocess(["ssh", "node%d" % id] + command)
 
 def get_sysctl_parameter(name):
     """
@@ -491,11 +555,10 @@ def get_sysctl_parameter(name):
 
     name:      name of the desired configuration parameter
     """
-    output = subprocess.run(["sysctl", name], stdout=subprocess.PIPE,
-            encoding="utf-8").stdout.rstrip()
+    output = do_subprocess(["sysctl", name])
     match = re.match('.*= (.*)', output)
     if not match:
-         raise Error("Couldn't parse sysctl output: %s" % output)
+         raise Exception("Couldn't parse sysctl output: %s" % output)
     return match.group(1)
 
 def set_sysctl_parameter(name, value, nodes):
@@ -510,14 +573,42 @@ def set_sysctl_parameter(name, value, nodes):
     vlog("Setting Homa parameter %s to %s on nodes %s" % (name, value,
             str(nodes)))
     for id in nodes:
-        subprocess.run(["ssh", "node%d" % id, "sudo", "sysctl",
-                "%s=%s" % (name, value)], stdout=subprocess.DEVNULL)
+        do_subprocess(["ssh", "node%d" % id, "sudo", "sysctl",
+                "%s=%s" % (name, value)])
 
-def start_servers(r, options):
+def get_node_type():
+    """
+    Returns the node type for this machine.
+    """
+
+    global node_type
+    if node_type:
+        return node_type
+    f = open("/var/emulab/boot/nodetype")
+    node_type = f.read().strip()
+    f.close()
+    return node_type
+
+def do_subprocess(words):
+    """
+    Invoke subprocess.run to run args in a child process and then
+    check the results. Log any errors that are detected. Returns
+    stdout from the child (with trailing newlines removed).
+
+    words:   List of words for the command to run.
+    """
+    result = subprocess.run(words, capture_output=True, encoding="utf-8")
+    if (result.returncode != 0):
+        log("Command %s exited with status %d" % (words, result.returncode))
+    if (result.stderr != ""):
+        log("Error output from %s: %s" % (words, result.stderr.rstrip()))
+    return result.stdout.rstrip()
+
+def start_servers(ids, options):
     """
     Starts cp_node servers running on a group of nodes
 
-    r:       A group of node ids on which to start cp_node servers
+    ids:     A list of node ids on which to start cp_node servers
     options: A namespace that must contain at least the following
              keys, which will be used to configure the servers:
                  server_ports
@@ -525,20 +616,20 @@ def start_servers(r, options):
                  protocol
     """
     global server_nodes
-    log("Starting %s servers %d:%d" % (options.protocol, r.start, r.stop-1))
+    log("Starting %s servers on nodes %s" % (options.protocol, ids))
     if len(server_nodes) > 0:
         do_cmd("stop servers", server_nodes)
-        server_nodes = range(0,0)
-    start_nodes(r, options)
+        server_nodes = []
+    start_nodes(ids, options)
     if options.protocol == "homa":
         do_cmd("server --ports %d --port-threads %d --protocol %s %s" % (
                 options.server_ports, options.port_threads,
-                options.protocol, options.ipv6), r)
+                options.protocol, options.ipv6), ids)
     else:
         do_cmd("server --ports %d --port-threads %d --protocol %s %s" % (
                 options.tcp_server_ports, options.tcp_port_threads,
-                options.protocol, options.ipv6), r)
-    server_nodes = r
+                options.protocol, options.ipv6), ids)
+    server_nodes = ids
 
 def run_experiment(name, clients, options):
     """
@@ -552,40 +643,32 @@ def run_experiment(name, clients, options):
               which control the experiment:
                   client_max
                   client_ports
-                  first_server
                   gbps
                   port_receivers
                   protocol
                   seconds
-                  server_nodes
                   server_ports
+                  servers
                   tcp_client_ports
                   tcp_server_ports
                   workload
     """
 
     global active_nodes
+    exp_nodes = list(set(options.servers + list(clients)))
     start_nodes(clients, options)
     nodes = []
-    log("Starting %s experiment with clients %d:%d" % (
-            name, clients.start, clients.stop-1))
-    num_servers = len(server_nodes)
-    if "server_nodes" in options:
-        num_servers = options.server_nodes
-    first_server = server_nodes.start
-    if "first_server" in options:
-        first_server = options.first_server
+    log("Starting %s experiment with clients %s" % (name, clients))
     for id in clients:
         if options.protocol == "homa":
             command = "client --ports %d --port-receivers %d --server-ports %d " \
-                    "--workload %s --server-nodes %d --first-server %d " \
-                    "--gbps %.3f --client-max %d --protocol %s --id %d %s" % (
+                    "--workload %s --servers %s --gbps %.3f --client-max %d " \
+                    "--protocol %s --id %d %s" % (
                     options.client_ports,
                     options.port_receivers,
                     options.server_ports,
                     options.workload,
-                    num_servers,
-                    first_server,
+                    ",".join([str(x) for x in options.servers]),
                     options.gbps,
                     options.client_max,
                     options.protocol,
@@ -599,14 +682,13 @@ def run_experiment(name, clients, options):
             else:
                 trunc = ''
             command = "client --ports %d --port-receivers %d --server-ports %d " \
-                    "--workload %s --server-nodes %d --first-server %d " \
-                    "--gbps %.3f %s --client-max %d --protocol %s --id %d %s" % (
+                    "--workload %s --servers %s --gbps %.3f %s --client-max %d " \
+                    "--protocol %s --id %d %s" % (
                     options.tcp_client_ports,
                     options.tcp_port_receivers,
                     options.tcp_server_ports,
                     options.workload,
-                    num_servers,
-                    first_server,
+                    ",".join([str(x) for x in options.servers]),
                     options.gbps,
                     trunc,
                     options.client_max,
@@ -626,9 +708,8 @@ def run_experiment(name, clients, options):
             # Wait a bit so that homa_prio can set priorities appropriately
             time.sleep(2)
             vlog("Recording initial metrics")
-            for id in active_nodes:
-                subprocess.run(["ssh", "node%d" % (id), "metrics.py"],
-                        stdout=subprocess.DEVNULL)
+            for id in exp_nodes:
+                do_subprocess(["ssh", "node%d" % (id), "metrics.py"])
         if not "no_rtt_files" in options:
             do_cmd("dump_times /dev/null", clients)
         do_cmd("log Starting %s experiment" % (name), server_nodes, clients)
@@ -644,14 +725,14 @@ def run_experiment(name, clients, options):
     log("Retrieving data for %s experiment" % (name))
     if not "no_rtt_files" in options:
         do_cmd("dump_times rtts", clients)
-    if options.protocol == "homa":
-        vlog("Recording final metrics")
-        for id in active_nodes:
+    if (options.protocol == "homa") and not "unloaded" in options:
+        vlog("Recording final metrics from nodes %s" % (exp_nodes))
+        for id in exp_nodes:
             f = open("%s/%s-%d.metrics" % (options.log_dir, name, id), 'w')
             subprocess.run(["ssh", "node%d" % (id), "metrics.py"], stdout=f)
             f.close()
-        shutil.copyfile("%s/%s-%d.metrics" % (options.log_dir, name, first_server),
-                "%s/reports/%s-%d.metrics" % (options.log_dir, name, first_server))
+        shutil.copyfile("%s/%s-%d.metrics" % (options.log_dir, name, options.servers[0]),
+                "%s/reports/%s-%d.metrics" % (options.log_dir, name, options.servers[0]))
         shutil.copyfile("%s/%s-%d.metrics" % (options.log_dir, name, clients[0]),
                 "%s/reports/%s-%d.metrics" % (options.log_dir, name, clients[0]))
     do_cmd("stop senders", clients)
@@ -663,7 +744,7 @@ def run_experiment(name, clients, options):
     do_cmd("stop clients", clients)
     if not "no_rtt_files" in options:
         for id in clients:
-            subprocess.run(["rsync", "-rtvq", "node%d:rtts" % (id),
+            do_subprocess(["rsync", "-rtvq", "node%d:rtts" % (id),
                     "%s/%s-%d.rtts" % (options.log_dir, name, id)])
 
 def scan_log(file, node, experiments):
@@ -674,7 +755,7 @@ def scan_log(file, node, experiments):
     file:         Name of the log file to read
     node:         Name of the node that generated the log, such as "node1".
     experiments:  Info from the given log file is added to this structure
-                  * At the top level it is dictionary indexed by experiment
+                  * At the top level it is a dictionary indexed by experiment
                     name, where
                   * Each value is dictionary indexed by node name, where
                   * Each value is a dictionary with keys such as client_kops,
@@ -751,8 +832,9 @@ def scan_log(file, node, experiments):
             if match:
                 if not "backups" in node_data:
                     node_data["backups"] = []
-                node_data["backups"].append(float(match.group(1))
-                        /float(match.group(2)))
+                total = float(match.group(2))
+                if total > 0:
+                    node_data["backups"].append(float(match.group(1))/total)
                 continue
         if "FATAL:" in line:
             log("%s: %s" % (file, line[:-1]))
@@ -766,7 +848,7 @@ def scan_log(file, node, experiments):
 
 def scan_logs():
     """
-    Read all of the nodespecific log files produced by a run, and
+    Read all of the node-specific log files produced by a run, and
     extract useful information.
     """
     global log_dir, verbose
@@ -826,14 +908,20 @@ def scan_logs():
                 vlog("%s average: %.1f Kops/sec"
                         % (type.capitalize(), totals[kops_key]/len(averages)))
 
+        for key in ["client_gbps", "client_kops", "server_gbps", "server_kops"]:
+            if not key in totals:
+                log("%s missing in node log files" % (key))
+                totals[key] = 0
+
         log("\nClients for %s experiment: %d nodes, %.2f Gbps, %.1f Kops/sec "
                 "(avg per node)" % (name, len(nodes["client"]),
                 totals["client_gbps"]/len(nodes["client"]),
                 totals["client_kops"]/len(nodes["client"])))
-        log("Servers for %s experiment: %d nodes, %.2f Gbps, %.1f Kops/sec "
-                "(avg per node)" % (name, len(nodes["server"]),
-                totals["server_gbps"]/len(nodes["server"]),
-                totals["server_kops"]/len(nodes["server"])))
+        if len(nodes["server"]) > 0:
+            log("Servers for %s experiment: %d nodes, %.2f Gbps, %.1f Kops/sec "
+                    "(avg per node)" % (name, len(nodes["server"]),
+                    totals["server_gbps"]/len(nodes["server"]),
+                    totals["server_kops"]/len(nodes["server"])))
         log("Overall for %s experiment: %d nodes, %.2f Gbps, %.1f Kops/sec "
                 "(avg per node)" % (name, len(nodes["all"]),
                 (totals["client_gbps"] + totals["server_gbps"])/len(nodes["all"]),
@@ -858,18 +946,83 @@ def scan_logs():
                     % (100.0*sum(backups)/len(backups)))
     log("")
 
-def read_rtts(file, rtts):
+def scan_metrics(experiment):
+    """
+    Reads in all of the .metrics files generated by an experiment,
+    extracts a few interesting statistics, and logs message if some
+    nodes appear to have significantly different behavior than
+    others (to detect flakey nodes)
+    """
+
+    metrics_files = sorted(glob.glob(log_dir + ("/%s-*.metrics" % (experiment))))
+    if len(metrics_files) == 0:
+        return
+
+    metric_names = ({'packets_sent_RESEND', 'packets_rcvd_RESEND'})
+    docs = {'cores': 'core utilization',
+            'packets_sent_RESEND': 'outgoing resend requests',
+            'packets_rcvd_RESEND': 'incoming resend requests'}
+    units = {'cores': '',
+            'packets_sent_RESEND': '/s',
+            'packets_rcvd_RESEND': '/s'}
+    thresholds = {'cores': 2,
+            'packets_sent_RESEND': 5,
+            'packets_rcvd_RESEND': 5}
+    # Keys are same as in docs above, values are dictionaries, in which
+    # keys are metric file names and values are the value of the corresponding
+    # metric name in that metrics file.
+    metrics = {}
+    for name in docs.keys():
+        metrics[name] = {}
+    for file in metrics_files:
+        f = open(file)
+        for name in docs.keys():
+            metrics[name][file] = 0
+        for line in f:
+            match = re.match('Total Core Utilization *([0-9.]+)', line)
+            if match:
+                metrics['cores'][file] = float(match.group(1))
+                continue
+            match = re.match('([^ ]+) +([0-9]+) +\( *([0-9.]+ *[MKG]?)/s', line)
+            if not match:
+                continue
+            name = match.group(1)
+            if name in metric_names:
+                metrics[name][file] = unscale_number(match.group(3))
+        f.close()
+    outlier_count = 0
+    for name in metrics:
+        values = sorted(metrics[name].values())
+        median = values[len(values)//2]
+        if (median == 0) and name == 'cores':
+            log("Couldn't find core utilization in metrics files")
+            continue
+        for file, value in metrics[name].items():
+            if (value >= thresholds[name]) and (value > 1.5*median):
+                log("Outlier %s in %s: %s vs. %s median"
+                        % (docs[name], file, scale_number(value, units[name]),
+                        scale_number(median, units[name])))
+
+def read_rtts(file, rtts, min_rtt = 0.0, link_mbps = 0.0):
     """
     Read a file generated by cp_node's "dump_times" command and add its
-    data to the information present in rtts.
+    data to the information present in rtts. Also computes average slowdown
+    across all the data in this file.
 
-    file:    Name of the log file.
-    rtts:    Dictionary whose keys are message lengths; each value is a
-             list of all of the rtts recorded for that message length (in usecs)
-    Returns: The total number of rtts read from the file.
+    file:       Name of the log file.
+    rtts:       Dictionary whose keys are message lengths; each value is a
+                list of all of the rtts recorded for that message length
+                (in usecs)
+    min_rtt:    If nonzero, gives the minimum possible RTT for a short RPC
+                (used to compute slowdowns)
+    link_mbps:  Speed of the host's uplink in Mbps.
+    Returns:    The total number of rtts read from the file, and also the
+                average slowdown from this file. If min_rtt is zero, then
+                the slowdown will be zero.
     """
 
-    total = 0
+    num_rtts = 0
+    slowdown_sum = 0
     f = open(file, "r")
     for line in f:
         stripped = line.strip()
@@ -877,7 +1030,7 @@ def read_rtts(file, rtts):
             continue
         words = stripped.split()
         if (len(words) < 2):
-            print("Line in %s too short (need at least 2 columns): '%s'" %
+            log("Line in %s too short (need at least 2 columns): '%s'" %
                     (file, line))
             continue
         length = int(words[0])
@@ -886,9 +1039,13 @@ def read_rtts(file, rtts):
             rtts[length].append(usec)
         else:
             rtts[length] = [usec]
-        total += 1
+        if min_rtt > 0:
+            slowdown_sum += usec/(min_rtt + length*8/link_mbps)
+        num_rtts += 1
     f.close()
-    return total
+    if num_rtts == 0:
+        return 0, 0
+    return num_rtts, slowdown_sum/num_rtts
 
 def get_buckets(rtts, total):
     """
@@ -909,10 +1066,11 @@ def get_buckets(rtts, total):
 
 def set_unloaded(experiment):
     """
-    Compute the optimal RTTs for each message size.
+    Collect measurements from an unloaded system to use in computing slowdowns.
 
     experiment:   Name of experiment that measured RTTs under low load
     """
+    global unloaded_p50, min_rtt
 
     # Find (or generate) unloaded data for comparison.
     files = sorted(glob.glob("%s/%s-*.rtts" % (log_dir, experiment)))
@@ -922,8 +1080,11 @@ def set_unloaded(experiment):
     for file in files:
         read_rtts(file, rtts)
     unloaded_p50.clear()
+    min_rtt = 1e20
     for length in rtts.keys():
-        unloaded_p50[length] = sorted(rtts[length])[len(rtts[length])//2]
+        sorted_rtts = sorted(rtts[length])
+        unloaded_p50[length] = sorted_rtts[len(rtts[length])//2]
+        min_rtt = min(min_rtt, sorted_rtts[0])
     vlog("Computed unloaded_p50: %d entries" % len(unloaded_p50))
 
 def get_digest(experiment):
@@ -936,7 +1097,7 @@ def get_digest(experiment):
 
     experiment:  Name of the desired experiment
     """
-    global digests, log_dir, unloaded_p50
+    global old_slowdown, digests, log_dir, min_rtt, unloaded_p50, delete_rtts
 
     if experiment in digests:
         return digests[experiment]
@@ -953,6 +1114,10 @@ def get_digest(experiment):
     digest["slow_99"] = []
     digest["slow_999"] = []
 
+    avg_slowdowns = []
+
+    link_mbps = float(get_sysctl_parameter(".net.homa.link_mbps"))
+
     # Read in the RTT files for this experiment.
     files = sorted(glob.glob(log_dir + ("/%s-*.rtts" % (experiment))))
     if len(files) == 0:
@@ -961,13 +1126,28 @@ def get_digest(experiment):
     sys.stdout.write("Reading RTT data for %s experiment: " % (experiment))
     sys.stdout.flush()
     for file in files:
-        digest["total_messages"] += read_rtts(file, digest["rtts"])
+        count, slowdown = read_rtts(file, digest["rtts"], min_rtt, link_mbps)
+        digest["total_messages"] += count
+        avg_slowdowns.append([file, slowdown])
         sys.stdout.write("#")
         sys.stdout.flush()
-    print("")
+
+        if delete_rtts and not ("unloaded" in file):
+            os.remove(file)
+    log("")
+
+    # See if some nodes have anomalous performance.
+    overall_avg = 0.0
+    for info in avg_slowdowns:
+        overall_avg += info[1]
+    overall_avg = overall_avg/len(avg_slowdowns)
+    for info in avg_slowdowns:
+        if (info[1] < 0.8*overall_avg) or (info[1] > 1.2*overall_avg):
+            log("Outlier alt-slowdown in %s: %.1f vs. %.1f overall average"
+                    % (info[0], info[1], overall_avg))
 
     if len(unloaded_p50) == 0:
-        raise Exception("No unloaded data: must invoked set_unloaded")
+        raise Exception("No unloaded data: must invoke set_unloaded")
 
     rtts = digest["rtts"]
     buckets = get_buckets(rtts, digest["total_messages"])
@@ -976,9 +1156,13 @@ def get_digest(experiment):
     bucket_rtts = []
     bucket_slowdowns = []
     bucket_count = 0
-    cur_unloaded = unloaded_p50[min(unloaded_p50.keys())]
+    slowdown_sum = 0.0
     lengths = sorted(rtts.keys())
     lengths.append(999999999)            # Force one extra loop iteration
+    if old_slowdown:
+        optimal = unloaded_p50[min(unloaded_p50.keys())]
+    else:
+        optimal = 15 + lengths[0]*8/link_mbps
     for length in lengths:
         if length > bucket_length:
             digest["lengths"].append(bucket_length)
@@ -1002,13 +1186,21 @@ def get_digest(experiment):
             bucket_count = 0
             bucket_length, bucket_cum_frac = buckets[next_bucket]
             next_bucket += 1
-        if length in unloaded_p50:
-            cur_unloaded = unloaded_p50[length]
+        if old_slowdown:
+            optimal = unloaded_p50[length]
+        elif length in unloaded_p50:
+            optimal = 15 + length*8/link_mbps
         bucket_count += len(rtts[length])
         for rtt in rtts[length]:
             bucket_rtts.append(rtt)
-            bucket_slowdowns.append(rtt/cur_unloaded)
-    log("Digest finished for %s" % (experiment))
+            slowdown = rtt/optimal
+            bucket_slowdowns.append(slowdown)
+            slowdown_sum += slowdown
+    digest["avg_slowdown"] = slowdown_sum/digest["total_messages"]
+    log("Digest finished for %s, %d RPCs, average slowdown %.2f, "
+            "best-case RTT %.1f us" % (experiment, digest["total_messages"],
+            digest["avg_slowdown"], min_rtt))
+
 
     dir = "%s/reports" % (log_dir)
     f = open("%s/reports/%s.data" % (log_dir, experiment), "w")
@@ -1029,7 +1221,7 @@ def get_digest(experiment):
 
 def start_slowdown_plot(title, max_y, x_experiment, size=10,
         show_top_label=True, show_bot_label=True, figsize=[6,4],
-        y_label="Slowdown", show_upper_x_axis= True):
+        y_label="Slowdown", show_upper_x_axis=True):
     """
     Create a pyplot graph that will be used for slowdown data. Returns the
     Axes object for the plot.
@@ -1329,6 +1521,43 @@ def get_short_cdf(experiment):
     f.close()
     return [x, y]
 
+def read_file_data(file):
+    """
+    Reads data from a file and returns a dict whose keys are column names
+    and whose values are lists of values from the given column.
+
+    file:   Path to the file containing the desired data. The file consists
+            of initial line containing space-separated column names, followed
+            any number of lines of data. Blank lines and lines starting with
+            "#" are ignored.
+    """
+    columns = {}
+    names = None
+    f = open(file)
+    for line in f:
+        fields = line.strip().split()
+        if len(fields) == 0:
+            continue
+        if fields[0] == '#':
+            continue
+        if not names:
+            names = fields
+            for n in names:
+                columns[n] = []
+        else:
+            if len(fields) != len(names):
+                print("Bad line in %s: %s (expected %d columns, got %d)"
+                        % (file, line.rstrip(), len(columns), len(fields)))
+                continue
+            for i in range(0, len(names)):
+                try:
+                    value = float(fields[i])
+                except ValueError:
+                    value = fields[i]
+                columns[names[i]].append(value)
+    f.close()
+    return columns
+
 def column_from_file(file, column):
     """
     Return a list containing a column of data from a given file.
@@ -1363,3 +1592,45 @@ def column_from_file(file, column):
                 data[columns[i]].append(float(fields[i]))
     data_from_files[file] = data
     return data[column]
+
+def scale_number(number, units):
+    """
+    Return a string describing a number, but with a "K", "M", or "G"
+    suffix to keep the number small and readable.
+
+    number: number to scale
+    units:  additional units designation, such as "bps" or "/s" to add
+    """
+
+    if number > 1000000000:
+        return "%.1f G%s" % (number/1000000000.0, units)
+    if number > 1000000:
+        return "%.1f M%S" % (number/1000000.0, units)
+    elif (number > 1000):
+        return "%.1f K%s" % (number/1000.0, units)
+    else:
+        if units == "":
+            space = ""
+        else:
+            space = " "
+        return "%.1f%s%s" % (number, space, units)
+
+def unscale_number(number):
+    """
+    Given a string representation of a number, which may have a "K",
+    "M", or "G" scale factor (e.g. "1.2 M"), return the actual number
+    (e.g. 1200000).
+    """
+    match = re.match("([0-9.]+) *([GMK]?)$", number)
+    if not match:
+        raise Exception("Couldn't unscale '%s': bad syntax" % (number))
+    mantissa = float(match.group(1))
+    scale = match.group(2)
+    if scale == 'G':
+        return mantissa * 1e09
+    elif scale == 'M':
+        return mantissa * 1e06
+    elif scale == 'K':
+        return mantissa * 1e03
+    else:
+        return mantissa
