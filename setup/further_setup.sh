@@ -1,5 +1,7 @@
 #!/bin/bash -i
 
+sudo apt-get install gcc-12 -y
+
 make
 cd util
 make
