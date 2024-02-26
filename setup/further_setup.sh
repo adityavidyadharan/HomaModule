@@ -1,7 +1,7 @@
 #!/bin/bash -i
 
 sudo apt-get update
-sudo apt-get install gcc-12 -y
+sudo apt-get install gcc-12 htop -y
 
 make
 cd util

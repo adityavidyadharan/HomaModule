@@ -1459,7 +1459,7 @@ void tcp_server::accept(int epoll_fd)
 	 */
 	if (client_addr.in4.sin_family == AF_INET) {
 		uint8_t *ipaddr = (uint8_t *) &client_addr.in4.sin_addr;
-		if ((ipaddr[0] != 10) || (ipaddr[1] != 0) || (ipaddr[2] != 1)) {
+		if ((ipaddr[0] != 10) || (ipaddr[1] != 10) || (ipaddr[2] != 1)) {
 			log(NORMAL, "ERROR: tcp_server::accept rejecting "
 					"rogue TCP connection from %s\n",
 					print_address(&client_addr));
