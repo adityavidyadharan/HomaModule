@@ -509,6 +509,11 @@ struct message_header {
 	uint32_t msg_id;
 };
 
+struct ack_element {
+	struct message_header header;
+	uint64_t send_time;
+};
+
 /**
  * init_server_addrs() - Set up the server_addrs table (addresses of the
  * server/port combinations that clients will communicate with), based on
@@ -1844,6 +1849,7 @@ public:
 	void sender(void);
 	virtual void stop_sender(void);
 	bool wait_response(homa::receiver *receiver, uint64_t rpc_id);
+	void msg_ack_thread();
 
 	/** @fd: file descriptor for Homa socket. */
 	int fd;
@@ -1880,6 +1886,20 @@ public:
 	 * responses if port_receivers is 0).
 	 */
 	std::optional<std::thread> sending_thread;
+
+	/**
+	 * lock the shared queue of messages
+    */
+	std::mutex ack_lock;
+	/**
+	 * Shared queue holding outstanding messages 
+	*/
+	std::vector<ack_element*> ack_queue;
+
+	/**
+	 * timeout for messages to resend
+	*/
+	uint64_t timeout;
 };
 
 /**
@@ -1898,6 +1918,11 @@ homa_client::homa_client(int id)
         , sender_buffer(new char[HOMA_MAX_MESSAGE_LENGTH])
         , receiving_threads()
         , sending_thread()
+		, ack_lock()
+		, ack_queue()
+		, timeout(2000)
+		
+		
 {
 	struct homa_set_buf_args arg;
 
@@ -1923,6 +1948,9 @@ homa_client::homa_client(int id)
 				strerror(errno));
 		exit(1);
 	}
+
+	std::optional<std::thread> check_resend_msg;
+	check_resend_msg.emplace(&homa_client::msg_ack_thread, this);
 
 	if (unloaded) {
 		measure_unloaded(unloaded);
@@ -2020,8 +2048,79 @@ bool homa_client::wait_response(homa::receiver *receiver, uint64_t rpc_id)
 	uint64_t end_time = rdtsc();
 	tt("Received response, cid 0x%08x, id %x, %d bytes",
 			header->cid, header->msg_id, length);
+	// verify that this is an ack to an outstanding request
+	ack_lock.lock();
+	bool found = false;
+	for (ack_element* msg : ack_queue) {
+		if (msg->header.msg_id == header->msg_id) {
+			ack_lock.unlock();
+			found = true;
+			break;
+		}
+	}
+	if (!found) {
+		ack_lock.unlock();
+		log(NORMAL, "ERROR: response received for unknown msg_id %u\n",
+				header->msg_id);
+		return true;
+	}
+
+	// remove from the ack queue
+	ack_lock.lock();
+	for (size_t i = 0; i < ack_queue.size(); i++) {
+		ack_element* msg = ack_queue[i];
+		if (msg->header.msg_id == header->msg_id) {
+			delete msg;
+			ack_queue.erase(ack_queue.begin() + i);
+			break;
+		}
+		i++;
+	}
+	ack_lock.unlock();
 	record(end_time, header);
 	return true;
+}
+
+
+void homa_client::msg_ack_thread() {
+	while (1) {
+		ack_lock.lock();
+		for (ack_element *msg : ack_queue) {
+			//if message time > timeout, resend message
+			uint64_t now = rdtsc();
+			if (now - msg->send_time >= timeout) { //change threshold
+				// update send_time
+				msg->send_time = now;
+				message_header header = msg->header;
+				int status;
+				uint64_t rpc_id;
+				int server = server_dist(rand_gen);
+				tt("resending request, cid 0x%08x, id %u, length %d",
+				header.cid, header.msg_id, header.length);
+				if (client_iovec && (header.length > 20)) {
+					struct iovec vec[2];
+					vec[0].iov_base = sender_buffer;
+					vec[0].iov_len = 20;
+					vec[1].iov_base = sender_buffer + 20;
+					vec[1].iov_len = header.length - 20;
+					status = homa_sendv(fd, vec, 2,
+						&server_addrs[server], &rpc_id, 0);
+				} else {
+					status = homa_send(fd, sender_buffer, header.length,
+					&server_addrs[server], &rpc_id, 0);
+					if (status < 0) {
+						log(NORMAL, "FATAL: error in homa_send: %s (request ""length %d)\n", strerror(errno), header.length);
+						exit(1);
+					}
+				}
+				// stats
+				requests[server]++;
+				total_requests++;
+			}
+		}
+		ack_lock.unlock();
+		std::this_thread::sleep_for (std::chrono::microseconds(10000));
+	}
 }
 
 /**
@@ -2093,6 +2192,13 @@ void homa_client::sender()
 					header->length);
 			exit(1);
 		}
+		// start thread to wait for callback
+		ack_element *ack = new ack_element;
+		ack->header = *header;
+		ack->send_time = now;
+		ack_lock.lock();
+		ack_queue.push_back(ack);
+		ack_lock.unlock();
 		requests[server]++;
 		total_requests++;
 		lag = now - next_start;
