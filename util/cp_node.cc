@@ -1900,6 +1900,8 @@ public:
 	 * timeout for messages to resend
 	*/
 	uint64_t timeout;
+
+	std::optional<std::thread> check_resend_msg;
 };
 
 /**
@@ -1948,8 +1950,6 @@ homa_client::homa_client(int id)
 				strerror(errno));
 		exit(1);
 	}
-
-	std::optional<std::thread> check_resend_msg;
 	check_resend_msg.emplace(&homa_client::msg_ack_thread, this);
 
 	if (unloaded) {
@@ -1990,6 +1990,8 @@ homa_client::~homa_client()
 		sending_thread->join();
 	for (std::thread &thread: receiving_threads)
 		thread.join();
+	if (check_resend_msg)
+		check_resend_msg->join();
 	munmap(buf_region, buf_size);
 	check_completion("homa");
 }
